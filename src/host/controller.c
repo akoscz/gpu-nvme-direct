@@ -167,11 +167,10 @@ gpunvme_err_t gpunvme_ctrl_init(gpunvme_ctrl_t *ctrl,
 
     fprintf(stderr, "ctrl: Controller enabled and ready\n");
 
-    /* Settling delay: DRAM-less controllers (MAP1602) may need significant time
-     * after CSTS.RDY=1 to fully initialize internal firmware before accepting
-     * admin commands — especially after a hard PCIe FLR via sysfs.
-     * The kernel nvme driver polls up to 60 s; we use 2 s as a safe default. */
-    sleep_ms(2000);
+    /* Settling delay: brief pause after CSTS.RDY=1 before the first admin
+     * command.  Most controllers are ready immediately; this covers edge cases
+     * with slow DRAM-less controller firmware startup. */
+    sleep_ms(250);
 
     /* 9. Identify Controller */
     {

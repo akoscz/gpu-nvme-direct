@@ -191,6 +191,51 @@ gpunvme_err_t gpunvme_layer_loader_init(gpunvme_layer_loader_t *loader,
      * cpu_db path in sq_submit.cuh / cq_poll.cuh. */
     loader->bar0_gpu = NULL;
 
+    /* Enable PCI Bus Master (DMA) in the device's PCI command register.
+     *
+     * After a PCIe Function Level Reset (FLR) — whether triggered by our
+     * auto-recovery code or by 'echo 1 > /sys/bus/pci/devices/.../reset' —
+     * the PCI command register resets to its default value with Bus Master
+     * (bit 2) DISABLED.  Without Bus Master, the NVMe controller cannot
+     * perform DMA to host memory: doorbell writes reach the controller but
+     * it silently drops every admin command (no DMA → no CQ completion).
+     *
+     * We also set Memory Space enable (bit 1) as a safety net. */
+    {
+        char cfg_path[256];
+        snprintf(cfg_path, sizeof(cfg_path),
+                 "/sys/bus/pci/devices/%s/config", pci_bdf);
+        int cfg_fd = open(cfg_path, O_RDWR);
+        if (cfg_fd >= 0) {
+            uint16_t pci_cmd = 0;
+            if (pread(cfg_fd, &pci_cmd, 2, 4) == 2) {
+                uint16_t needed = pci_cmd | 0x0006;  /* bit1=MemSpc, bit2=BusMaster */
+                if (needed != pci_cmd) {
+                    if (pwrite(cfg_fd, &needed, 2, 4) == 2) {
+                        fprintf(stderr,
+                            "layer_loader: PCI command: 0x%04x → 0x%04x "
+                            "(Bus Master + Memory Space enabled)\n",
+                            pci_cmd, needed);
+                    } else {
+                        fprintf(stderr,
+                            "layer_loader: WARNING: could not enable Bus Master "
+                            "(pwrite config failed: %s)\n", strerror(errno));
+                    }
+                } else {
+                    fprintf(stderr,
+                        "layer_loader: PCI command: 0x%04x (Bus Master already set)\n",
+                        pci_cmd);
+                }
+            }
+            close(cfg_fd);
+        } else {
+            fprintf(stderr,
+                "layer_loader: WARNING: cannot open %s (%s) — "
+                "DMA may fail if Bus Master is disabled\n",
+                cfg_path, strerror(errno));
+        }
+    }
+
     /* Initialize NVMe controller (CPU-side only).
      * If the controller reports Fatal Status (CSTS.CFS=1) — typically caused by
      * a prior crash that left it in a dirty state — attempt a PCI Function Level
