@@ -19,7 +19,7 @@
 #include <cuda_runtime.h>
 #include <gpunvme/layer_loader.h>
 
-#define STATIC_BAR1_OFFSET 0x20000000ULL  /* 512MB — matches nvidia driver */
+#define STATIC_BAR1_OFFSET 0x0ULL  /* 0 = scan from BAR1 start (auto-detect, recommended) */
 
 /* GPU kernel to zero a buffer */
 __global__ void gpu_memset_zero(uint8_t *buf, size_t n) {
@@ -27,10 +27,29 @@ __global__ void gpu_memset_zero(uint8_t *buf, size_t n) {
     if (i < n) buf[i] = 0;
 }
 
-/* GPU kernel to read 8 bytes from VRAM and report */
+/* Read a uint64_t bypassing ALL GPU caches (L1 + L2).
+ * PTX ld.volatile.global reads directly from DRAM — essential for verifying
+ * externally DMA'd data that bypassed GPU cache hierarchy (e.g. NVMe BAR1 writes). */
+__device__ __forceinline__ uint64_t ldcv_u64(const uint64_t *ptr) {
+    uint64_t val;
+    asm volatile("ld.volatile.global.u64 %0, [%1];"
+                 : "=l"(val)
+                 : "l"((const unsigned long long *)ptr)
+                 : "memory");
+    return val;
+}
+
+/* GPU kernel to read words from VRAM, bypassing all caches */
 __global__ void gpu_read_words(const uint64_t *buf, uint64_t *out, int count) {
     int i = threadIdx.x;
-    if (i < count) out[i] = buf[i];
+    if (i < count) out[i] = ldcv_u64(buf + i);
+}
+
+/* GPU kernel: copy N bytes from VRAM to host-mapped buffer using volatile loads.
+ * Each thread handles one uint64_t. Use for DMA-write verification when L2 may be stale. */
+__global__ void gpu_extract_nocache(const uint64_t *src, uint64_t *dst, int n_words) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n_words) dst[i] = ldcv_u64(src + i);
 }
 
 int main(int argc, char **argv) {
@@ -135,10 +154,22 @@ int main(int argc, char **argv) {
     if (err != GPUNVME_OK) {
         fprintf(stderr, "FAIL: Tier 1 load_layer: %d\n", err);
     } else {
-        /* Copy VRAM to host for comparison */
+        /* Copy VRAM to host for comparison using cache-bypassing reads.
+         * cudaMemcpy(D2H) uses L2 which may have stale zeros from gpu_memset_zero.
+         * gpu_extract_nocache uses ld.volatile.global to read past all caches. */
         void *vram_copy;
         cudaMallocHost(&vram_copy, test_size);
-        cudaMemcpy(vram_copy, vram_buf, test_size, cudaMemcpyDeviceToHost);
+        {
+            uint64_t *vram_copy_dev = nullptr;
+            cudaMalloc(&vram_copy_dev, test_size);
+            int n_words = (int)(test_size / sizeof(uint64_t));
+            int threads = 256;
+            int blocks = (n_words + threads - 1) / threads;
+            gpu_extract_nocache<<<blocks, threads>>>((const uint64_t*)vram_buf, vram_copy_dev, n_words);
+            cudaDeviceSynchronize();
+            cudaMemcpy(vram_copy, vram_copy_dev, test_size, cudaMemcpyDeviceToHost);
+            cudaFree(vram_copy_dev);
+        }
 
         int mismatches = 0;
         const uint8_t *a = (const uint8_t *)host_buf;

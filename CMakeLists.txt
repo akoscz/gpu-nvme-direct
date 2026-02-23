@@ -88,7 +88,7 @@ if(NOT GPUNVME_USE_SIM)
     target_include_directories(gpunvme_layer_loader PUBLIC
         ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(gpunvme_layer_loader PUBLIC
-        gpunvme_host gpunvme_device CUDA::cudart)
+        gpunvme_host gpunvme_device CUDA::cudart CUDA::cuda_driver)
 endif()
 
 # ---------- Tests ----------

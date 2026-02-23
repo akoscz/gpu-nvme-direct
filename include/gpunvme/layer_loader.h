@@ -48,8 +48,9 @@ typedef struct gpunvme_layer_loader {
 
     /* BAR1 direct VRAM mode (Tier 2) */
     int bar1_fd;               /* fd for GPU resource1_wc */
-    uint64_t gpu_bar1_phys;    /* GPU BAR1 PCIe physical base (e.g., 0x7000000000) */
-    uint64_t bar1_vram_offset; /* static BAR1 offset where VRAM starts (e.g., 0x20000000) */
+    uint64_t gpu_bar1_phys;    /* GPU BAR1 PCIe physical base (e.g., 0x4000000000) */
+    uint64_t bar1_vram_offset; /* hint: BAR1 offset where VRAM starts (0 = auto-scan from start) */
+    uint64_t bar1_size;        /* actual BAR1 window size in bytes (from resource file) */
     int bar1_enabled;          /* nonzero if BAR1 mode initialized */
 } gpunvme_layer_loader_t;
 
@@ -97,7 +98,7 @@ uint64_t gpunvme_layer_loader_ns_blocks(const gpunvme_layer_loader_t *loader);
  * Requires nvidia module loaded with NVreg_RegistryDwords="RMForceStaticBar1=1"
  *
  * gpu_bdf:            GPU PCI BDF string (e.g., "0000:0a:00.0")
- * static_bar1_offset: BAR1 offset where VRAM mapping starts (typically 0x20000000)
+ * static_bar1_offset: hint for where VRAM mapping starts in BAR1 (pass 0 to scan from start)
  */
 gpunvme_err_t gpunvme_bar1_init(gpunvme_layer_loader_t *loader,
                                  const char *gpu_bdf,
