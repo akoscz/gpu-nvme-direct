@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cerrno>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -190,9 +191,47 @@ gpunvme_err_t gpunvme_layer_loader_init(gpunvme_layer_loader_t *loader,
      * cpu_db path in sq_submit.cuh / cq_poll.cuh. */
     loader->bar0_gpu = NULL;
 
-    /* Initialize NVMe controller (CPU-side only) */
+    /* Initialize NVMe controller (CPU-side only).
+     * If the controller reports Fatal Status (CSTS.CFS=1) — typically caused by
+     * a prior crash that left it in a dirty state — attempt a PCI Function Level
+     * Reset via sysfs and retry once.  This is safe when the device has been
+     * unbound from the nvme kernel driver (vfio-pci or no driver). */
     gpunvme_err_t err = gpunvme_ctrl_init(&loader->ctrl, loader->bar0, loader->bar0_size);
-    if (err != GPUNVME_OK) {
+    if (err == GPUNVME_ERR_CTRL_FATAL) {
+        char reset_path[256];
+        snprintf(reset_path, sizeof(reset_path),
+                 "/sys/bus/pci/devices/%s/reset", pci_bdf);
+        fprintf(stderr, "layer_loader: CSTS.CFS=1 — attempting PCI FLR via %s\n", reset_path);
+
+        int rf = open(reset_path, O_WRONLY);
+        if (rf >= 0) {
+            if (write(rf, "1", 1) == 1) {
+                fprintf(stderr, "layer_loader: PCI FLR issued — waiting 500ms for controller ready\n");
+            } else {
+                fprintf(stderr, "layer_loader: PCI FLR write failed: %s\n", strerror(errno));
+            }
+            close(rf);
+        } else {
+            fprintf(stderr, "layer_loader: cannot open %s (%s) — "
+                    "run: sudo sh -c 'echo 1 > %s' then retry\n",
+                    reset_path, strerror(errno), reset_path);
+        }
+
+        /* Give the controller time to complete the FLR and self-initialize */
+        usleep(500000);  /* 500 ms */
+
+        /* Retry controller init */
+        err = gpunvme_ctrl_init(&loader->ctrl, loader->bar0, loader->bar0_size);
+        if (err != GPUNVME_OK) {
+            fprintf(stderr, "layer_loader: controller init failed after FLR: %s\n"
+                    "layer_loader: ensure the NVMe is unbound from its kernel driver:\n"
+                    "  echo %s | sudo tee /sys/bus/pci/drivers/nvme/unbind\n"
+                    "  echo 1 | sudo tee /sys/bus/pci/devices/%s/reset\n",
+                    gpunvme_err_str(err), pci_bdf, pci_bdf);
+            goto fail_bar0;
+        }
+        fprintf(stderr, "layer_loader: controller init OK after PCI FLR\n");
+    } else if (err != GPUNVME_OK) {
         fprintf(stderr, "layer_loader: controller init failed: %s\n", gpunvme_err_str(err));
         goto fail_bar0;
     }
