@@ -739,40 +739,95 @@ gpunvme_err_t gpunvme_load_layer_vram(gpunvme_layer_loader_t *loader,
 
     /* Build PRP entries using BAR1 physical addresses.
      * Unlike pagemap, we compute addresses directly:
-     * dest_bar1_phys + offset = physical address visible on PCIe bus */
+     * dest_bar1_phys + offset = physical address visible on PCIe bus
+     *
+     * PRP alignment rules (NVMe spec 4.4):
+     *   PRP1: may have a non-zero page offset (bits[11:2] need not be 0).
+     *   PRP2 (when used as a direct page pointer OR as a PRP list pointer):
+     *     bits[11:0] MUST be 0 (4KB-aligned).
+     *   PRP list entries: bits[11:0] MUST be 0 (4KB-aligned).
+     *
+     * When chunk_phys has a non-zero page offset, the second and subsequent
+     * page addresses are NOT chunk_phys + p*page_size.  They are the 4KB
+     * page boundaries that follow the first partial page.  Concretely:
+     *   second_page = (chunk_phys + page_size - 1) & ~(page_size - 1)
+     *   third_page  = second_page + page_size
+     *   ...
+     * The number of pages also changes accordingly.
+     */
     int pm_fd = loader->pagemap_fd;
+
+    /* Diagnostic: warn once if dest_bar1_phys is not page-aligned.
+     * PRP1 may have an offset, but the fixup below handles it correctly. */
+    if (dest_bar1_phys & (page_size - 1)) {
+        fprintf(stderr,
+            "load_layer_vram: WARNING dest_bar1_phys=0x%llx has page offset 0x%llx "
+            "— applying page-boundary PRP fixup\n",
+            (unsigned long long)dest_bar1_phys,
+            (unsigned long long)(dest_bar1_phys & (page_size - 1)));
+    }
 
     for (uint32_t i = 0; i < n_commands; i++) {
         uint32_t remaining_blocks = total_blocks - i * loader->blocks_per_cmd;
         uint32_t cmd_blocks = (remaining_blocks < loader->blocks_per_cmd)
                               ? remaining_blocks : loader->blocks_per_cmd;
         uint32_t cmd_bytes = cmd_blocks * block_size;
-        uint32_t cmd_pages = (cmd_bytes + page_size - 1) / page_size;
 
         /* This command's PRP list page (still in host pinned memory) */
         uint64_t *list_virt = (uint64_t *)((uint8_t *)loader->prp_pool + (size_t)i * 4096);
         uint64_t list_phys = virt_to_phys_pagemap(pm_fd, list_virt);
+        if (list_phys == 0) {
+            fprintf(stderr,
+                "load_layer_vram: failed to resolve PRP list phys for cmd %u\n", i);
+            return GPUNVME_ERR_DMA;
+        }
+        if (list_phys & (page_size - 1)) {
+            fprintf(stderr,
+                "load_layer_vram: PRP list phys 0x%llx not page-aligned for cmd %u\n",
+                (unsigned long long)list_phys, i);
+            return GPUNVME_ERR_DMA;
+        }
 
-        /* Compute BAR1 physical address for each data page */
-        uint64_t chunk_phys = dest_bar1_phys + (uint64_t)i * loader->ctrl.max_transfer_bytes;
-        uint64_t prp1 = 0, prp2 = 0;
+        /* PRP1: starting physical address for this command.
+         * May have a non-zero page offset — that is explicitly allowed for PRP1. */
+        uint64_t chunk_phys = dest_bar1_phys
+                              + (uint64_t)i * loader->ctrl.max_transfer_bytes;
+        uint64_t page_offset = chunk_phys & (uint64_t)(page_size - 1);
 
-        for (uint32_t p = 0; p < cmd_pages; p++) {
-            uint64_t phys = chunk_phys + (uint64_t)p * page_size;
+        /* Second and subsequent pages must start on 4KB boundaries.
+         * second_page_phys is the first 4KB boundary AFTER chunk_phys. */
+        uint64_t second_page_phys = (chunk_phys + page_size - 1) & ~(uint64_t)(page_size - 1);
 
-            if (p == 0) {
-                prp1 = phys;
+        /* Number of 4KB pages touched by this transfer:
+         *   - 1 partial-or-full first page (bytes from chunk_phys to second_page_phys)
+         *   - ceil(remaining / page_size) full pages after that               */
+        uint32_t cmd_pages;
+        if (page_offset == 0) {
+            /* chunk_phys is page-aligned: simple division */
+            cmd_pages = (cmd_bytes + page_size - 1) / page_size;
+        } else {
+            uint32_t first_page_bytes = page_size - (uint32_t)page_offset;
+            if (cmd_bytes <= first_page_bytes) {
+                cmd_pages = 1;  /* fits entirely in the first partial page */
             } else {
-                list_virt[p - 1] = phys;
+                cmd_pages = 1 + (cmd_bytes - first_page_bytes + page_size - 1) / page_size;
             }
+        }
+
+        uint64_t prp1 = chunk_phys;  /* allowed to carry page offset */
+        uint64_t prp2 = 0;
+
+        /* Fill PRP list: entries for pages 2, 3, ... (all must be 4KB-aligned) */
+        for (uint32_t p = 1; p < cmd_pages; p++) {
+            list_virt[p - 1] = second_page_phys + (uint64_t)(p - 1) * page_size;
         }
 
         if (cmd_pages <= 1) {
             prp2 = 0;
         } else if (cmd_pages == 2) {
-            prp2 = list_virt[0];
+            prp2 = list_virt[0];   /* directly the second page — guaranteed 4KB-aligned */
         } else {
-            prp2 = list_phys;
+            prp2 = list_phys;      /* PRP list pointer — 4KB-aligned (checked above) */
         }
 
         loader->prp1_array[i] = prp1;
