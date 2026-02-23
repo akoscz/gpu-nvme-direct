@@ -758,13 +758,19 @@ gpunvme_err_t gpunvme_load_layer_vram(gpunvme_layer_loader_t *loader,
     int pm_fd = loader->pagemap_fd;
 
     /* Diagnostic: warn once if dest_bar1_phys is not page-aligned.
-     * PRP1 may have an offset, but the fixup below handles it correctly. */
+     * PRP1 may have an offset — the fixup below handles it correctly.
+     * cudaMalloc only guarantees 256-byte alignment; the physical address from
+     * cuPointerGetAttribute may have any alignment within a 4KB page. */
     if (dest_bar1_phys & (page_size - 1)) {
-        fprintf(stderr,
-            "load_layer_vram: WARNING dest_bar1_phys=0x%llx has page offset 0x%llx "
-            "— applying page-boundary PRP fixup\n",
-            (unsigned long long)dest_bar1_phys,
-            (unsigned long long)(dest_bar1_phys & (page_size - 1)));
+        static uint64_t s_warned_phys = UINT64_MAX;
+        if (dest_bar1_phys != s_warned_phys) {
+            s_warned_phys = dest_bar1_phys;
+            fprintf(stderr,
+                "load_layer_vram: NOTE dest_bar1_phys=0x%llx has page offset 0x%llx "
+                "— page-boundary PRP fixup active (one-time notice)\n",
+                (unsigned long long)dest_bar1_phys,
+                (unsigned long long)(dest_bar1_phys & (page_size - 1)));
+        }
     }
 
     for (uint32_t i = 0; i < n_commands; i++) {
