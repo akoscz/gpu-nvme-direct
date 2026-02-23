@@ -167,6 +167,11 @@ gpunvme_err_t gpunvme_ctrl_init(gpunvme_ctrl_t *ctrl,
 
     fprintf(stderr, "ctrl: Controller enabled and ready\n");
 
+    /* Settling delay: DRAM-less controllers (MAP1602) may need brief time after
+     * CSTS.RDY=1 to fully initialize internal firmware before accepting admin
+     * commands — especially after a hard reset (PCIe FLR via sysfs). */
+    sleep_ms(250);
+
     /* 9. Identify Controller */
     {
         void *id_buf;
@@ -269,8 +274,10 @@ gpunvme_err_t gpunvme_admin_submit(gpunvme_ctrl_t *ctrl,
     uint32_t db_off = nvme_sq_doorbell_offset(0, ctrl->dstrd);
     host_mmio_write32(nvme_reg_ptr(ctrl->bar0, db_off), ctrl->admin_sq_tail);
 
-    /* Poll admin CQ for completion */
-    for (uint32_t i = 0; i < ctrl->timeout_ms * 1000; i++) {
+    /* Poll admin CQ for completion.
+     * Use rdy_timeout_ms (capped at 10s) not timeout_ms (up to 127.5s on MAP1602).
+     * Admin commands should complete in milliseconds on a healthy controller. */
+    for (uint32_t i = 0; i < ctrl->rdy_timeout_ms * 1000; i++) {
         volatile nvme_cq_entry_t *cqe = &ctrl->admin_cq[ctrl->admin_cq_head];
         uint16_t sp = cqe->status_phase;
 
