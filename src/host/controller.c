@@ -167,10 +167,11 @@ gpunvme_err_t gpunvme_ctrl_init(gpunvme_ctrl_t *ctrl,
 
     fprintf(stderr, "ctrl: Controller enabled and ready\n");
 
-    /* Settling delay: DRAM-less controllers (MAP1602) may need brief time after
-     * CSTS.RDY=1 to fully initialize internal firmware before accepting admin
-     * commands — especially after a hard reset (PCIe FLR via sysfs). */
-    sleep_ms(250);
+    /* Settling delay: DRAM-less controllers (MAP1602) may need significant time
+     * after CSTS.RDY=1 to fully initialize internal firmware before accepting
+     * admin commands — especially after a hard PCIe FLR via sysfs.
+     * The kernel nvme driver polls up to 60 s; we use 2 s as a safe default. */
+    sleep_ms(2000);
 
     /* 9. Identify Controller */
     {
@@ -269,6 +270,11 @@ gpunvme_err_t gpunvme_admin_submit(gpunvme_ctrl_t *ctrl,
 
     /* Advance tail */
     ctrl->admin_sq_tail = (ctrl->admin_sq_tail + 1) % ctrl->admin_sq_size;
+
+    /* Ensure SQ entry writes reach DRAM before the doorbell write goes out
+     * on the PCIe bus.  x86 TSO does not order prior WB (cache) stores before
+     * subsequent WC/UC (MMIO) stores — mfence is required. */
+    __asm__ __volatile__("mfence" ::: "memory");
 
     /* Ring admin SQ doorbell */
     uint32_t db_off = nvme_sq_doorbell_offset(0, ctrl->dstrd);
