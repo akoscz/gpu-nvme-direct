@@ -17,6 +17,7 @@
 #include "error.h"
 #include "controller.h"
 #include "queue.h"
+#include "cpu_doorbell.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -27,8 +28,14 @@ typedef struct gpunvme_layer_loader {
     gpunvme_io_queue_t ioq;
     int bar0_fd;
     volatile void *bar0;
-    void *bar0_gpu;
+    void *bar0_gpu;              /* NULL when CPU doorbell mode is active */
     size_t bar0_size;
+
+    /* CPU doorbell mode: set when cudaHostRegisterIoMemory is not used.
+     * cpu_db is cudaMallocHost'd so GPU kernels can access it directly.
+     * cpu_db_ctx owns the polling thread (started in init, stopped in destroy). */
+    gpunvme_cpu_db_state_t *cpu_db;
+    gpunvme_cpu_db_ctx_t   *cpu_db_ctx;
 
     /* PRP pool: single page-aligned alloc, one 4KB page per command */
     void *prp_pool;

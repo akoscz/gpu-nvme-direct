@@ -79,8 +79,23 @@ cq_poll_result cq_poll_completion(gpu_nvme_queue *q, uint64_t timeout_cycles) {
             /* Advance CQ head (handles wrap + phase flip) */
             gpu_nvme_advance_cq_head(q);
 
-            /* Write CQ head doorbell to free the slot */
-            doorbell_write_cq_head(q->doorbell_cq, q->cq_head);
+            /* Write CQ head doorbell to free the slot.
+             * Direct mode: GPU writes BAR0 MMIO.
+             * CPU doorbell mode: hand off to the CPU polling thread. */
+            if (q->doorbell_cq) {
+                doorbell_write_cq_head(q->doorbell_cq, q->cq_head);
+            } else if (q->cpu_db) {
+                q->cpu_db->cq_head = q->cq_head;
+                __threadfence_system();
+                q->cpu_db->cq_pending = 1;
+                __threadfence_system();
+                uint64_t t_cq = clock64();
+                while (q->cpu_db->cq_pending != 0) {
+                    if (clock64() - t_cq > 3400000000ULL)
+                        break;
+                }
+                __threadfence_system();
+            }
 
             return result;
         }

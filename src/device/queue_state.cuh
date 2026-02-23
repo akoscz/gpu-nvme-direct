@@ -16,6 +16,7 @@
 #include <stdbool.h>
 #endif
 #include <gpunvme/nvme_regs.h>
+#include <gpunvme/cpu_doorbell.h>
 
 /* GPU-visible NVMe queue pair state.
  * This struct lives in device-accessible memory (pinned host or GPU VRAM).
@@ -52,6 +53,18 @@ typedef struct gpu_nvme_queue {
      * Read from this after SQ entry writes, before doorbell write,
      * to ensure SQ data reaches DRAM before NVMe reads it. */
     volatile uint32_t *pcie_flush_addr;
+
+    /* CPU doorbell fallback.
+     * When doorbell_sq/doorbell_cq are NULL (i.e., cudaHostRegisterIoMemory
+     * was not used), the GPU cannot write BAR0 MMIO directly.  Instead the
+     * GPU writes the desired tail/head value here and sets the pending flag;
+     * a CPU polling thread picks it up and performs the actual BAR0 write.
+     *
+     * Allocated via cudaMallocHost so the GPU kernel can access it as a
+     * regular pointer without special MMIO semantics.
+     *
+     * NULL when direct GPU doorbell mode is active (doorbell_sq != NULL). */
+    gpunvme_cpu_db_state_t *cpu_db;
 
     /* Timeout for polling (in GPU clock cycles, 0 = no timeout) */
     uint64_t poll_timeout_cycles;

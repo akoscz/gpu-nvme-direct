@@ -68,7 +68,7 @@ uint16_t sq_submit_read(gpu_nvme_queue *q,
     sqe->cdw14 = 0;
     sqe->cdw15 = 0;
 
-    /* Ensure all SQ entry writes are globally visible */
+    /* Ensure all SQ entry writes are globally visible before doorbell */
     __threadfence_system();
 
     /* PCIe write flush: read from BAR0 to ensure SQ entry writes
@@ -80,11 +80,30 @@ uint16_t sq_submit_read(gpu_nvme_queue *q,
         volatile uint32_t __attribute__((unused)) flush = mmio_read32(q->pcie_flush_addr);
     }
 
-    /* Ring the doorbell */
-    doorbell_write_sq_tail(q->doorbell_sq, q->sq_tail);
+    if (q->doorbell_sq) {
+        /* Direct GPU doorbell: GPU writes BAR0 MMIO via cudaHostRegisterIoMemory */
+        doorbell_write_sq_tail(q->doorbell_sq, q->sq_tail);
+        __threadfence_system();
+    } else if (q->cpu_db) {
+        /* CPU doorbell fallback: hand off to the CPU polling thread.
+         *
+         * __threadfence_system() above already flushed the SQ entry to DRAM.
+         * Now write sq_tail so the CPU thread knows what value to ring, then
+         * set sq_pending = 1.  A second __threadfence_system() ensures the
+         * CPU observes sq_tail before sq_pending (prevents reorder). */
+        q->cpu_db->sq_tail = q->sq_tail;
+        __threadfence_system();
+        q->cpu_db->sq_pending = 1;
+        __threadfence_system();
 
-    /* Ensure doorbell write reaches PCIe */
-    __threadfence_system();
+        /* Spin until CPU thread acks the doorbell write (~1 s GPU-cycle timeout) */
+        uint64_t t_db = clock64();
+        while (q->cpu_db->sq_pending != 0) {
+            if (clock64() - t_db > 3400000000ULL)
+                break;  /* CPU thread died — proceed anyway, will likely timeout on CQ */
+        }
+        __threadfence_system();  /* re-establish ordering after spin */
+    }
 
     return cid;
 }
@@ -123,8 +142,22 @@ uint16_t sq_submit_write(gpu_nvme_queue *q,
     if (q->pcie_flush_addr) {
         volatile uint32_t __attribute__((unused)) flush = mmio_read32(q->pcie_flush_addr);
     }
-    doorbell_write_sq_tail(q->doorbell_sq, q->sq_tail);
-    __threadfence_system();
+
+    if (q->doorbell_sq) {
+        doorbell_write_sq_tail(q->doorbell_sq, q->sq_tail);
+        __threadfence_system();
+    } else if (q->cpu_db) {
+        q->cpu_db->sq_tail = q->sq_tail;
+        __threadfence_system();
+        q->cpu_db->sq_pending = 1;
+        __threadfence_system();
+        uint64_t t_db = clock64();
+        while (q->cpu_db->sq_pending != 0) {
+            if (clock64() - t_db > 3400000000ULL)
+                break;
+        }
+        __threadfence_system();
+    }
 
     return cid;
 }

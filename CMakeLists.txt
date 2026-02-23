@@ -75,6 +75,7 @@ if(NOT GPUNVME_USE_SIM)
         src/host/dma_alloc.c
         src/host/pci_util.c
         src/host/monitor.c
+        src/host/cpu_doorbell.c
     )
     target_include_directories(gpunvme_host PUBLIC
         ${CMAKE_SOURCE_DIR}/include

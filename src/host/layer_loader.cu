@@ -23,6 +23,16 @@
 #include <gpunvme/queue.h>
 #include <gpunvme/dma.h>
 #include <gpunvme/error.h>
+#include <gpunvme/cpu_doorbell.h>
+
+extern "C" {
+    int  gpunvme_cpu_db_start(gpunvme_cpu_db_state_t *db,
+                               volatile void          *bar0,
+                               uint32_t                sq_db_off,
+                               uint32_t                cq_db_off,
+                               gpunvme_cpu_db_ctx_t  **ctx_out);
+    void gpunvme_cpu_db_stop(gpunvme_cpu_db_ctx_t *ctx);
+}
 
 #include "device/queue_state.cuh"
 #include "device/mmio_ops.cuh"
@@ -143,7 +153,17 @@ gpunvme_err_t gpunvme_layer_loader_init(gpunvme_layer_loader_t *loader,
     loader->pagemap_fd = -1;
     loader->bar1_fd = -1;
 
-    /* Map BAR0 */
+    /* Map BAR0 (CPU-only — we deliberately do NOT call cudaHostRegisterIoMemory
+     * on NVMe BAR0.  On NVIDIA Blackwell (and other architectures using GSP
+     * firmware), registering an NVMe controller's MMIO region with CUDA triggers
+     * erroneous KernelChannelGroupApi alloc RPCs that corrupt GSP state, causing
+     * all subsequent CUDA contexts to fail.
+     *
+     * Instead we use CPU doorbell mode: the GPU kernel writes the desired
+     * SQ tail / CQ head values into a small pinned struct, and a dedicated CPU
+     * thread performs the actual BAR0 MMIO writes on its behalf.
+     *
+     * BAR0 is therefore opened read-write for the CPU only (no CUDA mapping). */
     char path[256];
     snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/resource0", pci_bdf);
 
@@ -165,29 +185,18 @@ gpunvme_err_t gpunvme_layer_loader_init(gpunvme_layer_loader_t *loader,
         return GPUNVME_ERR_BAR_MAP;
     }
 
-    /* Register BAR0 with CUDA for GPU MMIO access */
-    cudaError_t cerr = cudaHostRegister(
-        (void *)loader->bar0, loader->bar0_size,
-        cudaHostRegisterIoMemory | cudaHostRegisterMapped);
-    if (cerr != cudaSuccess) {
-        fprintf(stderr, "layer_loader: cudaHostRegisterIoMemory failed: %s\n",
-                cudaGetErrorString(cerr));
-        munmap((void *)loader->bar0, loader->bar0_size);
-        close(loader->bar0_fd);
-        loader->bar0 = NULL;
-        loader->bar0_fd = -1;
-        return GPUNVME_ERR_CUDA;
-    }
+    /* bar0_gpu stays NULL — CPU doorbell mode; io_queue.c checks this and
+     * leaves gq->doorbell_sq / gq->doorbell_cq as NULL, triggering the
+     * cpu_db path in sq_submit.cuh / cq_poll.cuh. */
+    loader->bar0_gpu = NULL;
 
-    cudaHostGetDevicePointer(&loader->bar0_gpu, (void *)loader->bar0, 0);
-
-    /* Initialize NVMe controller */
+    /* Initialize NVMe controller (CPU-side only) */
     gpunvme_err_t err = gpunvme_ctrl_init(&loader->ctrl, loader->bar0, loader->bar0_size);
     if (err != GPUNVME_OK) {
         fprintf(stderr, "layer_loader: controller init failed: %s\n", gpunvme_err_str(err));
         goto fail_bar0;
     }
-    loader->ctrl.bar0_gpu = loader->bar0_gpu;
+    loader->ctrl.bar0_gpu = NULL;  /* explicitly clear — never set for CPU doorbell mode */
 
     loader->blocks_per_cmd = loader->ctrl.max_transfer_bytes / loader->ctrl.block_size;
     loader->max_commands = (uint32_t)((max_layer_bytes + loader->ctrl.max_transfer_bytes - 1)
@@ -197,13 +206,44 @@ gpunvme_err_t gpunvme_layer_loader_init(gpunvme_layer_loader_t *loader,
     loader->pipeline_depth = pipeline_depth;
     if (loader->pipeline_depth > 60) loader->pipeline_depth = 60;
 
-    /* Create I/O queue */
+    /* Create I/O queue.
+     * Because ctrl.bar0_gpu == NULL, io_queue.c will leave gq->doorbell_sq and
+     * gq->doorbell_cq as NULL.  We fill in gq->cpu_db below. */
     err = gpunvme_create_io_queue(&loader->ctrl, 1, 64, 4096, GPUNVME_TIER1, &loader->ioq);
     if (err != GPUNVME_OK) {
         fprintf(stderr, "layer_loader: I/O queue creation failed: %s\n", gpunvme_err_str(err));
         gpunvme_ctrl_shutdown(&loader->ctrl);
         goto fail_bar0;
     }
+
+    /* Allocate CPU doorbell state in pinned host memory so the GPU kernel
+     * can access it as a regular pointer.  Then start the polling thread. */
+    if (cudaMallocHost((void **)&loader->cpu_db,
+                        sizeof(gpunvme_cpu_db_state_t)) != cudaSuccess) {
+        fprintf(stderr, "layer_loader: cpu_db alloc failed\n");
+        err = GPUNVME_ERR_NOMEM;
+        goto fail_ioq;
+    }
+    memset(loader->cpu_db, 0, sizeof(gpunvme_cpu_db_state_t));
+
+    {
+        /* Compute doorbell offsets from the same formula used by io_queue.c */
+        uint32_t sq_db_off = nvme_sq_doorbell_offset(1, loader->ctrl.dstrd);
+        uint32_t cq_db_off = nvme_cq_doorbell_offset(1, loader->ctrl.dstrd);
+
+        if (gpunvme_cpu_db_start(loader->cpu_db, loader->bar0,
+                                  sq_db_off, cq_db_off,
+                                  &loader->cpu_db_ctx) != 0) {
+            fprintf(stderr, "layer_loader: cpu doorbell thread start failed\n");
+            err = GPUNVME_ERR_IO;
+            cudaFreeHost(loader->cpu_db);
+            loader->cpu_db = NULL;
+            goto fail_ioq;
+        }
+    }
+
+    /* Wire the cpu_db pointer into the GPU-visible queue state struct */
+    loader->ioq.gpu_queue->cpu_db = loader->cpu_db;
 
     /* Allocate PRP pool: one 4KB page per command */
     loader->prp_pool_bytes = (size_t)loader->max_commands * 4096;
@@ -268,7 +308,7 @@ fail_ioq:
     gpunvme_delete_io_queue(&loader->ctrl, &loader->ioq);
     gpunvme_ctrl_shutdown(&loader->ctrl);
 fail_bar0:
-    cudaHostUnregister((void *)loader->bar0);
+    /* BAR0 is CPU-mapped only in CPU doorbell mode — no cudaHostUnregister */
     munmap((void *)loader->bar0, loader->bar0_size);
     close(loader->bar0_fd);
     loader->bar0 = NULL;
@@ -727,6 +767,16 @@ void gpunvme_layer_loader_destroy(gpunvme_layer_loader_t *loader) {
         loader->prp_pool = NULL;
     }
 
+    /* Stop CPU doorbell thread before deleting the queue (thread accesses BAR0) */
+    if (loader->cpu_db_ctx) {
+        gpunvme_cpu_db_stop(loader->cpu_db_ctx);
+        loader->cpu_db_ctx = NULL;
+    }
+    if (loader->cpu_db) {
+        cudaFreeHost(loader->cpu_db);
+        loader->cpu_db = NULL;
+    }
+
     gpunvme_delete_io_queue(&loader->ctrl, &loader->ioq);
     gpunvme_ctrl_shutdown(&loader->ctrl);
 
@@ -736,8 +786,12 @@ void gpunvme_layer_loader_destroy(gpunvme_layer_loader_t *loader) {
     }
     loader->bar1_enabled = 0;
 
+    /* BAR0 is CPU-mapped only (no cudaHostRegisterIoMemory in CPU doorbell mode) */
     if (loader->bar0) {
-        cudaHostUnregister((void *)loader->bar0);
+        if (loader->bar0_gpu) {
+            /* Legacy direct-GPU mode: unregister from CUDA */
+            cudaHostUnregister((void *)loader->bar0);
+        }
         munmap((void *)loader->bar0, loader->bar0_size);
         loader->bar0 = NULL;
     }
