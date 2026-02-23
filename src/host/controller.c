@@ -56,23 +56,40 @@ gpunvme_err_t gpunvme_ctrl_init(gpunvme_ctrl_t *ctrl,
     /* 1. Read Controller Capabilities */
     ctrl->cap.raw = host_mmio_read64(nvme_reg_ptr(bar0, NVME_REG_CAP));
     ctrl->dstrd = ctrl->cap.bits.dstrd;
+    /* CAP.TO is in 500ms units and can be up to 127.5s on some DRAM-less
+     * controllers (MAP1602 reports TO=255). Cap at 10s for init transitions —
+     * if the controller doesn't respond in 10s after CC.EN=0 it needs a PCIe FLR,
+     * not more waiting. Full TO is still used for admin command polling. */
     ctrl->timeout_ms = ctrl->cap.bits.to * 500;
+    ctrl->rdy_timeout_ms = (ctrl->timeout_ms < 10000) ? ctrl->timeout_ms : 10000;
     ctrl->max_queue_entries = ctrl->cap.bits.mqes + 1;
     ctrl->page_size = 1u << (12 + ctrl->cap.bits.mpsmin);
 
-    fprintf(stderr, "ctrl: CAP: MQES=%u, DSTRD=%u, TO=%ums, page=%uB\n",
-            ctrl->max_queue_entries, ctrl->dstrd, ctrl->timeout_ms, ctrl->page_size);
+    fprintf(stderr, "ctrl: CAP: MQES=%u, DSTRD=%u, TO=%ums (RDY cap=%ums), page=%uB\n",
+            ctrl->max_queue_entries, ctrl->dstrd, ctrl->timeout_ms,
+            ctrl->rdy_timeout_ms, ctrl->page_size);
 
     /* 2. Disable controller (CC.EN=0) */
     nvme_cc_t cc;
     cc.raw = host_mmio_read32(nvme_reg_ptr(bar0, NVME_REG_CC));
     if (cc.bits.en) {
+        fprintf(stderr, "ctrl: Controller enabled (dirty state from prior session), "
+                "disabling...\n");
         cc.bits.en = 0;
         host_mmio_write32(nvme_reg_ptr(bar0, NVME_REG_CC), cc.raw);
 
-        /* 3. Wait CSTS.RDY=0 */
-        gpunvme_err_t err = wait_csts_rdy(bar0, 0, ctrl->timeout_ms);
-        if (err != GPUNVME_OK) return err;
+        /* 3. Wait CSTS.RDY=0 — use capped timeout, not full CAP.TO.
+         * MAP1602 reports TO=255 (127.5s) but transition should complete in <1s.
+         * If it doesn't within rdy_timeout_ms, the controller needs a PCIe FLR:
+         *   echo 1 > /sys/bus/pci/devices/<BDF>/reset */
+        gpunvme_err_t err = wait_csts_rdy(bar0, 0, ctrl->rdy_timeout_ms);
+        if (err != GPUNVME_OK) {
+            fprintf(stderr, "ctrl: CSTS.RDY=0 timeout after %ums — controller stuck.\n"
+                    "ctrl: Fix: sudo sh -c 'echo 1 > /sys/bus/pci/devices/<BDF>/reset'\n"
+                    "ctrl: Then retry. This resets the NVMe controller via PCIe FLR.\n",
+                    ctrl->rdy_timeout_ms);
+            return err;
+        }
     }
 
     /* 4. Allocate Admin SQ/CQ in host pinned memory.
@@ -139,8 +156,8 @@ gpunvme_err_t gpunvme_ctrl_init(gpunvme_ctrl_t *ctrl,
     cc.bits.en = 1;
     host_mmio_write32(nvme_reg_ptr(bar0, NVME_REG_CC), cc.raw);
 
-    /* 8. Wait CSTS.RDY=1 */
-    gpunvme_err_t err = wait_csts_rdy(bar0, 1, ctrl->timeout_ms);
+    /* 8. Wait CSTS.RDY=1 — use capped timeout same as disable wait */
+    gpunvme_err_t err = wait_csts_rdy(bar0, 1, ctrl->rdy_timeout_ms);
     if (err != GPUNVME_OK) return err;
 
     ctrl->admin_sq_tail = 0;

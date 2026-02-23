@@ -32,7 +32,8 @@ typedef struct {
     nvme_cap_t cap;
     uint8_t dstrd;                /* Doorbell stride */
     uint32_t page_size;           /* Memory page size (bytes) */
-    uint32_t timeout_ms;          /* Controller timeout (ms) */
+    uint32_t timeout_ms;          /* Controller timeout (ms, from CAP.TO) */
+    uint32_t rdy_timeout_ms;      /* Capped timeout for CSTS.RDY transitions (≤10s) */
     uint16_t max_queue_entries;   /* Max entries per queue */
 
     /* Admin queue */
