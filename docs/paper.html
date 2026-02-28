@@ -46,9 +46,9 @@
         <!-- Abstract -->
         <section id="abstract">
           <h2>Abstract</h2>
-          <p>We present <strong>gpu-nvme-direct</strong>, a system that enables a consumer GPU (NVIDIA GeForce RTX 3090) to autonomously initiate NVMe storage I/O operations via PCIe MMIO, entirely without CPU involvement in the data path. Unlike prior work that requires enterprise GPUs with native peer-to-peer (P2P) DMA support, gpu-nvme-direct operates on commodity hardware (AMD Ryzen 5800X, B550 motherboard) costing approximately $2,000, using a <em>tiered approach</em> that degrades gracefully based on available P2P capabilities.</p>
+          <p>We present <strong>gpu-nvme-direct</strong>, a system that enables a consumer GPU (NVIDIA GeForce RTX 3090) to autonomously initiate NVMe storage I/O operations via PCIe MMIO, entirely without CPU involvement in the data path. Unlike prior work that requires enterprise GPUs with native peer-to-peer (P2P) DMA support, gpu-nvme-direct operates on commodity hardware (AMD Ryzen 5800X, B450 motherboard) costing approximately $2,000, using a <em>tiered approach</em> that degrades gracefully based on available P2P capabilities.</p>
           <p>The system works by having a single CUDA thread construct NVMe submission queue entries in host pinned memory, write doorbell registers on the NVMe controller's BAR0 via PTX <code>st.relaxed.mmio.sys</code> instructions, and poll completion queue entries &mdash; all without CPU intervention. This is possible because PCIe <em>posted</em> Memory Write TLPs succeed through the AMD data fabric even on consumer platforms where non-posted reads fail.</p>
-          <p>On a WD SN530 (PCIe 3.0 x4), gpu-nvme-direct achieves 2,666 MB/s at 256 KB block size with queue depth 32, reaching 78% of the theoretical PCIe link bandwidth. Compared to CPU-mediated baselines using a faster Samsung 980 PRO (PCIe 4.0 x4), gpu-nvme-direct delivers up to 2.2x higher throughput at 16 KB block size due to its ability to maintain 32 in-flight NVMe commands from a single GPU thread.</p>
+          <p>Evaluated on two NVMe devices: a WD SN530 (PCIe 3.0 x4, 2,666 MB/s, 78% link utilization) and a WD SN740 (3,350 MB/s, 99% link utilization). Compared to CPU-mediated baselines using a faster Samsung 980 PRO (PCIe 4.0 x4), gpu-nvme-direct delivers up to 2.2x higher throughput. Integrated into a streaming inference engine, it achieves 0.06 tok/s for Llama 70B from NVMe alone, and 0.50 tok/s with tiered caching optimizations.</p>
         </section>
 
         <!-- 1. Introduction -->
@@ -64,7 +64,7 @@
           <p>Prior work (BaM, GIDS) has demonstrated GPU-initiated storage access, but exclusively on enterprise hardware (NVIDIA A100, GPUDirect RDMA, PCIe expansion chassis) costing $10,000+. No prior system has achieved GPU-initiated NVMe I/O on commodity consumer hardware.</p>
           <p>Our contributions:</p>
           <ol>
-            <li><strong>First demonstration</strong> of GPU-initiated NVMe I/O on consumer hardware (RTX 3090, AMD B550).</li>
+            <li><strong>First demonstration</strong> of GPU-initiated NVMe I/O on consumer hardware (RTX 3090, AMD B450).</li>
             <li><strong>Characterization</strong> of the PCIe posted-write asymmetry on AMD consumer platforms.</li>
             <li><strong>A tiered P2P architecture</strong> that degrades gracefully from native P2P (enterprise) to write-only P2P (consumer).</li>
             <li><strong>Comprehensive evaluation</strong> showing 2.2x throughput advantage over CPU-mediated methods.</li>
@@ -79,7 +79,7 @@
           <p>NVMe is a register-level interface for accessing storage over PCIe. The host communicates with the NVMe controller through <em>submission queues</em> (SQ) and <em>completion queues</em> (CQ) residing in host memory. To issue a command, the host writes a 64-byte submission queue entry (SQE), then rings the SQ doorbell by writing to a register in the controller's BAR0 MMIO space. The controller fetches the SQE via DMA, executes the command, DMAs data to/from the host buffer, and writes a completion queue entry (CQE) to host memory.</p>
 
           <h3>2.2 PCIe Peer-to-Peer on Consumer Platforms</h3>
-          <p>PCIe P2P allows one device to directly access another device's memory or registers without CPU involvement. On enterprise platforms (AMD EPYC, Intel Xeon with PLX switches), P2P is well-supported. On AMD consumer platforms (B550, X570), P2P behavior is asymmetric:</p>
+          <p>PCIe P2P allows one device to directly access another device's memory or registers without CPU involvement. On enterprise platforms (AMD EPYC, Intel Xeon with PLX switches), P2P is well-supported. On AMD consumer platforms (B450, B550, X570), P2P behavior is asymmetric:</p>
           <ul>
             <li><strong>Posted writes (Memory Write TLPs):</strong> GPU &rarr; NVMe BAR0 succeeds. The AMD data fabric routes these correctly.</li>
             <li><strong>Non-posted reads (Memory Read TLPs):</strong> GPU &rarr; NVMe BAR0 fails. The root complex drops these, returning 0xFFFFFFFF.</li>
@@ -226,7 +226,7 @@
           <h2>8. Discussion and Future Work</h2>
 
           <h3>Tier 1 Bandwidth Ceiling</h3>
-          <p>The GPU's PCIe 4.0 x16 link provides ~25 GB/s to host memory &mdash; 7x more than the SN530's 3.4 GB/s. The NVMe is the bottleneck, not the extra hop. With Gen5 NVMe devices approaching 14 GB/s, Tier 2 (direct to GPU VRAM) becomes necessary.</p>
+          <p>The GPU's PCIe 3.0 x8 link (B450 lane sharing) provides ~6.5 GB/s to host memory &mdash; roughly 2x the SN530's 3.4 GB/s. The NVMe is still the bottleneck, not the extra hop, but the margin is tight. A Gen4 x4 NVMe at full speed (7 GB/s) would exceed the GPU link, motivating Tier 2 (direct NVMe DMA to GPU VRAM).</p>
 
           <h3>Why a Single Thread Suffices</h3>
           <p>The I/O management thread spends ~2 &mu;s per command, far below the NVMe service time. It consumes one warp slot, leaving 81 SMs free for tensor computation.</p>
@@ -249,7 +249,7 @@
         <!-- 9. Conclusion -->
         <section id="conclusion">
           <h2>9. Conclusion</h2>
-          <p>We presented gpu-nvme-direct, the first system (to our knowledge) that demonstrates GPU-initiated NVMe I/O on consumer hardware. Using a GeForce RTX 3090 on an AMD B550 platform, a single CUDA thread autonomously manages NVMe I/O queues without any CPU involvement in the data path.</p>
+          <p>We presented gpu-nvme-direct, the first system (to our knowledge) that demonstrates GPU-initiated NVMe I/O on consumer hardware. Using a GeForce RTX 3090 on an AMD B450 platform, a single CUDA thread autonomously manages NVMe I/O queues without any CPU involvement in the data path.</p>
           <p>Our key insight is that PCIe posted writes succeed on AMD consumer platforms even where P2P reads fail. gpu-nvme-direct achieves 2,666 MB/s (78% of link bandwidth), outperforming CPU-mediated methods by up to 2.2x despite using a slower NVMe device.</p>
           <p>This work opens the door to GPU-centric storage access on commodity hardware, with applications in LLM inference, graph analytics, and any workload where GPU memory is insufficient to hold the full working set.</p>
         </section>

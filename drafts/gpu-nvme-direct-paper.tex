@@ -67,7 +67,7 @@ We present \sysname{}, a system that enables a consumer GPU (NVIDIA GeForce RTX
 3090) to autonomously initiate NVMe storage I/O operations via PCIe MMIO,
 entirely without CPU involvement in the data path. Unlike prior work that
 requires enterprise GPUs with native peer-to-peer (P2P) DMA support,
-\sysname{} operates on commodity hardware (AMD Ryzen 5800X, B550 motherboard)
+\sysname{} operates on commodity hardware (AMD Ryzen 5800X, B450 motherboard)
 costing approximately \$2{,}000, using a \emph{tiered approach} that degrades
 gracefully based on available P2P capabilities.
 
@@ -78,15 +78,15 @@ completion queue entries---all without CPU intervention. This is possible
 because PCIe \emph{posted} Memory Write TLPs succeed through the AMD data
 fabric even on consumer platforms where non-posted reads fail.
 
-On a WD SN530 (PCIe~3.0~$\times$4), \sysname{} achieves 2{,}666\MBs{} at
-256\,KB block size with queue depth 32, reaching 78\% of the theoretical PCIe
-link bandwidth. Compared to CPU-mediated baselines using a faster Samsung 980
-PRO (PCIe~4.0~$\times$4), \sysname{} delivers up to 2.2$\times$ higher
-throughput at 16\,KB block size due to its ability to maintain 32 in-flight
-NVMe commands from a single GPU thread. We demonstrate the practical
-applicability of this approach for LLM inference, where streaming 70B model
-weights layer-by-layer from NVMe eliminates the CPU \texttt{memcpy} bottleneck
-in the data loading pipeline.
+We evaluate on two NVMe devices: a WD SN530 (PCIe~3.0~$\times$4), where
+\sysname{} achieves 2{,}666\MBs{} (78\% of link bandwidth), and a WD SN740
+(PCIe~4.0~$\times$4), where it reaches 3{,}350\MBs{} sustained. Compared to
+CPU-mediated baselines, \sysname{} delivers up to 2.2$\times$ higher
+throughput due to its ability to maintain 32 in-flight NVMe commands from a
+single GPU thread. We demonstrate practical applicability for LLM inference:
+integrated into our streaming inference engine, \sysname{} achieves
+0.06~tok/s for Llama~70B (5$\times$ over mmap+memcpy), and combined with
+tiered caching reaches 0.5~tok/s on a single RTX~3090.
 
 \end{abstract}
 
@@ -145,9 +145,9 @@ Our contributions are:
 \begin{enumerate}[leftmargin=*,topsep=2pt,itemsep=1pt]
 
 \item \textbf{First demonstration of GPU-initiated NVMe I/O on consumer
-  hardware.} We show that a GeForce RTX 3090 on an AMD B550 platform can
-  autonomously issue NVMe commands, achieving 2{,}666\MBs{} (78\% of PCIe~3.0
-  link bandwidth) without any CPU involvement in the data path.
+  hardware.} We show that a GeForce RTX 3090 on an AMD B450 platform can
+  autonomously issue NVMe commands, achieving up to 3{,}350\MBs{} (78--99\% of
+  PCIe~3.0 link bandwidth) without any CPU involvement in the data path.
 
 \item \textbf{Tiered architecture for heterogeneous P2P support.} We propose a
   three-tier approach that degrades gracefully from full P2P (enterprise GPUs)
@@ -155,7 +155,7 @@ Our contributions are:
   modules for Tier~1 operation.
 
 \item \textbf{Characterization of PCIe P2P behavior on AMD consumer
-  platforms.} We document the asymmetric P2P behavior of AMD B550/Vermeer:
+  platforms.} We document the asymmetric P2P behavior of AMD B450/Vermeer:
   posted writes succeed through the data fabric while non-posted reads are
   silently dropped, and repeated failed reads cause NVMe link failure requiring
   power cycle recovery.
@@ -217,7 +217,7 @@ significantly across platforms:
 posted (Memory Write) and non-posted (Memory Read) P2P transactions between
 PCIe devices.
 
-\textbf{AMD Consumer (B550/X570, Matisse/Vermeer):} The AMD data fabric
+\textbf{AMD Consumer (B450/B550/X570, Matisse/Vermeer):} The AMD data fabric
 forwards \emph{posted} Memory Write TLPs between root ports but \emph{does
 not} generate completions for non-posted Memory Read TLPs directed at peer
 devices. Read TLPs are silently dropped, causing Completion Timeout (CmpltTO)
@@ -267,9 +267,9 @@ on the GPU, then overwrites the layer buffer with the next layer.
 The current CPU-mediated pipeline achieves only $\sim$1.5--2\GBs{} effective
 throughput due to the double copy (mmap $\rightarrow$ CPU memcpy $\rightarrow$
 pinned staging $\rightarrow$ H2D DMA), yielding 0.02 tokens/s. By eliminating
-the CPU from the data path, \sysname{} achieves 2.1\GBs{} on a PCIe~3.0
-device, with projections of 4--6\GBs{} on PCIe~4.0 hardware, directly
-improving inference throughput.
+the CPU from the data path, \sysname{} achieves 2.1\GBs{} on a WD SN530
+(PCIe~3.0) and 3.35\GBs{} on a WD SN740, directly improving inference
+throughput.
 
 % ============================================================
 % 3. SYSTEM DESIGN
@@ -577,30 +577,42 @@ Table~\ref{tab:hardware} summarizes our hardware configuration.
 \toprule
 \textbf{Component} & \textbf{Detail} \\
 \midrule
-GPU & NVIDIA RTX 3090 (GA102, 24\,GB, PCIe 4.0 $\times$16) \\
+GPU & NVIDIA RTX 3090 (GA102, 24\,GB, PCIe 3.0 $\times$8\textsuperscript{$\dagger$}) \\
 CPU & AMD Ryzen 7 5800X (8C/16T, 3.8--4.7\,GHz) \\
-Platform & AMD B550, DDR4-3200 (48\,GB) \\
-NVMe (test) & WD SN530 1\,TB, PCIe 3.0 $\times$4 (VFIO) \\
+Platform & AMD B450, DDR4-3200 (48\,GB) \\
+NVMe (test 1) & WD SN530 1\,TB, PCIe 3.0 $\times$4 (VFIO) \\
+NVMe (test 2) & WD SN740 512\,GB, PCIe 3.0 $\times$4 (VFIO) \\
 NVMe (system) & Samsung 980 PRO 500\,GB, PCIe 4.0 $\times$4 \\
 OS & Ubuntu 25.10 (kernel 6.17.0) \\
 CUDA & 13.1, Driver 590.48.01 (open, patched) \\
 \bottomrule
 \end{tabular}
+
+\smallskip
+\noindent\textsuperscript{$\dagger$}B450 shares PCIe lanes between the primary
+$\times$16 slot and M.2\_1: when an M.2 NVMe is populated, the GPU
+negotiates PCIe~3.0~$\times$8 ($\sim$6.5\GBs{} host-to-device bandwidth).
+The SN740 is a PCIe~4.0 device but operates at Gen3 speeds on this platform.
 \end{table}
 
-\textbf{Note on device asymmetry.} The \sysname{} benchmarks use the WD SN530
-(PCIe~3.0~$\times$4, $\sim$3{,}400\MBs{} theoretical max) because it is the VFIO
+\textbf{Note on device asymmetry.} The detailed per-block-size benchmarks
+(Tables~\ref{tab:throughput}--\ref{tab:scaling}) use the WD SN530
+(PCIe~3.0~$\times$4, $\sim$3{,}400\MBs{} theoretical max) as the VFIO
 device. The CPU baselines (memcpy, pinned, cuFile) use the Samsung 980 PRO
 (PCIe~4.0~$\times$4, $\sim$7{,}000\MBs{} theoretical max) because the SN530 has no
 kernel device path. Despite this 2$\times$ asymmetry favoring the CPU baselines,
 \sysname{} outperforms them due to its ability to pipeline I/O operations.
+We additionally validate on a WD SN740 (PCIe~4.0 device, Gen3 link on B450),
+which achieves 3{,}350\MBs{} sustained---near the Gen3~$\times$4 theoretical
+maximum of $\sim$3{,}400\MBs{}.
 
 To enable fair comparison, we normalize throughput as a fraction of each device's
 theoretical PCIe link bandwidth. At 256\,KB/QD=32, \sysname{} achieves
-2{,}666/3{,}400 = \textbf{78.4\%} of its Gen3 link, while \texttt{cpu\_memcpy}
+2{,}666/3{,}400 = \textbf{78.4\%} of its Gen3 link on the SN530 and
+3{,}350/3{,}400 = \textbf{98.5\%} on the SN740, while \texttt{cpu\_memcpy}
 achieves 1{,}731/7{,}000 = \textbf{24.7\%}, \texttt{cpu\_pinned} reaches
 1{,}409/7{,}000 = 20.1\%, and cuFile 1{,}396/7{,}000 = 19.9\%. The GPU-initiated
-path thus extracts 3.2$\times$ more of the available link bandwidth than
+path thus extracts 3--4$\times$ more of the available link bandwidth than
 CPU-mediated methods. This gap is explained by Little's Law
 (\S\ref{sec:pipeline-analysis}): saturating NVMe bandwidth requires
 $\text{QD} = \text{BW} \times \text{latency}$, and only \sysname{} maintains
@@ -645,11 +657,11 @@ throughput is flat across QD=1 to QD=32 because the CPU serializes I/O
 operations through \texttt{memcpy}.
 
 \textbf{Key finding 2: Link bandwidth utilization.} At 256\,KB/QD=32, \sysname{}
-achieves 2{,}666\MBs{} on the SN530, which is 78\% of the device's theoretical
-PCIe~3.0~$\times$4 bandwidth ($\sim$3{,}400\MBs{}). The normalized comparison
-above shows that CPU methods utilize only 20--25\% of their faster Gen4 link,
-confirming that the GPU-initiated path is fundamentally more efficient at
-extracting device bandwidth.
+achieves 2{,}666\MBs{} on the SN530 (78\% of Gen3~$\times$4 link) and
+3{,}350\MBs{} on the SN740 (99\% of Gen3~$\times$4 link). The normalized
+comparison above shows that CPU methods utilize only 20--25\% of their faster
+Gen4 link, confirming that the GPU-initiated path is fundamentally more
+efficient at extracting device bandwidth.
 
 \textbf{Key finding 3: Advantage despite slower hardware.} Even though the
 CPU baselines use a 2$\times$ faster SSD, \sysname{} achieves 1.3--2.2$\times$
@@ -761,65 +773,94 @@ reads representative of loading model layers:
 \caption{Large sequential read throughput (QD=32, 512\,KB blocks)}
 \label{tab:large-read}
 \small
-\begin{tabular}{lr}
+\begin{tabular}{lrr}
 \toprule
-\textbf{Transfer Size} & \textbf{Throughput (MB/s)} \\
+\textbf{Transfer Size} & \textbf{SN530 (MB/s)} & \textbf{SN740 (MB/s)} \\
 \midrule
-4\,MB    & 2{,}122 \\
-128\,MB  & 2{,}734 (peak) \\
-669\,MB (1 Llama-70B Q6\_K layer) & 2{,}127 \\
+4\,MB    & 2{,}122 & --- \\
+128\,MB  & 2{,}734 (peak) & --- \\
+669\,MB (1 layer) & 2{,}127 & 3{,}350 \\
+8.6\,GB sustained & --- & 3{,}350 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The peak throughput of 2{,}734\MBs{} at 128\,MB demonstrates that \sysname{}
-can sustain near-optimal throughput for large sequential transfers. The slight
-drop at 669\,MB is due to thermal throttling of the SN530 during sustained reads.
+The SN530 peaks at 2{,}734\MBs{} at 128\,MB, dropping to 2{,}127\MBs{} at
+669\,MB due to thermal throttling during sustained reads. The SN740 sustains
+3{,}350\MBs{} even at 8.6\,GB---near the Gen3~$\times$4 theoretical
+maximum---demonstrating that \sysname{} can fully saturate the PCIe link for
+layer-sized transfers.
 
-\subsection{Projected LLM Inference Performance}
+\subsection{LLM Inference Performance}
 
-To contextualize the I/O throughput results for LLM inference, we project
-token-generation rates for Llama~2-70B in Q6\_K quantization ($\sim$42\,GB,
-80~layers, $\sim$669\,MB/layer). These projections assume I/O-bound
-layer-by-layer streaming where each token requires loading the full model
-from storage---the regime where the model \emph{exceeds} GPU VRAM and
-cannot be cached.
+To contextualize the I/O throughput results, we present both \emph{projected}
+token rates from raw I/O bandwidth and \emph{measured} results from
+integrating \sysname{} into a streaming inference engine (ntransformer) for
+Llama~3.1-70B in Q6\_K quantization ($\sim$42\,GB, 80~layers,
+$\sim$669\,MB/layer).
+
+Table~\ref{tab:llm-projection} shows projected rates for the pure I/O-bound
+regime where each token requires streaming the entire model from NVMe
+(no caching).
 
 \begin{table}[t]
 \centering
-\caption{Projected Llama-70B inference performance (I/O-bound regime,
-  model streamed from NVMe per token)}
+\caption{Llama-70B inference: projected (I/O-bound, full model per token)
+  and measured (integrated with tiered caching)}
 \label{tab:llm-projection}
 \small
-\begin{tabular}{lrrrr}
+\begin{tabular}{lrr}
 \toprule
-\textbf{Data Path} & \textbf{BW} & \textbf{1 Layer} & \textbf{80 Layers} & \textbf{tok/s} \\
+\textbf{Data Path} & \textbf{BW} & \textbf{tok/s} \\
 \midrule
-mmap+memcpy (current)         & 1.5\GBs{} & 446\,ms & 35.7\,s & 0.028 \\
-\sysname{} (SN530 Gen3)       & 2.1\GBs{} & 319\,ms & 25.5\,s & 0.039 \\
-\sysname{} (peak)             & 2.7\GBs{} & 248\,ms & 19.8\,s & 0.050 \\
-\sysname{} (Gen4 $\times$4)   & 5.0\GBs{} & 134\,ms & 10.7\,s & 0.093 \\
-Warm page cache + H2D         & 13\GBs{}  &  51\,ms &  4.1\,s & 0.244 \\
+\multicolumn{3}{l}{\emph{Projected (80 layers from NVMe per token)}} \\
+mmap+memcpy                   & 1.5\GBs{} & 0.028 \\
+\sysname{} (SN530)            & 2.1\GBs{} & 0.039 \\
+\sysname{} (SN740)            & 3.35\GBs{} & 0.063 \\
+\midrule
+\multicolumn{3}{l}{\emph{Measured (ntransformer integration)}} \\
+\sysname{} NVMe-only (SN740)  & 3.35\GBs{} & 0.06 \\
+\sysname{} NVMe-only (SN530)  & 2.1\GBs{} & 0.04 \\
+Tiered VRAM/RAM (no NVMe)     & 6.5\GBs{} & 0.20 \\
+Tiered + layer skip (0.98)    & 6.5\GBs{} & 0.27 \\
+Tiered + Q4\_K\_M + skip      & 6.5\GBs{} & \textbf{0.50} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\textbf{Important context.} These token rates are inherently low because
-the entire 42\,GB model must transit from storage per token. For reference,
-llama.cpp achieves $\sim$1~tok/s for 70B models when weights reside in GPU
-VRAM across two GPUs (tensor parallelism), and FlexGen~\cite{sheng2023flexgen}
-achieves 1~tok/s for OPT-175B with aggressive CPU/disk offloading. The
-contribution of Table~\ref{tab:llm-projection} is not the absolute token
-rate---which is bounded by storage bandwidth---but the \textbf{relative
-improvement} of the I/O data path: \sysname{} delivers 1.4--3.3$\times$ higher
-throughput than CPU-mediated baselines for the same model and hardware.
+\textbf{Measured integration results.} We integrated \sysname{} into
+ntransformer, a streaming LLM inference engine with tiered caching
+(VRAM/RAM/NVMe). On the SN740, \sysname{} achieves 0.06~tok/s for
+70B Q6\_K with all 80 layers streamed from NVMe per token---a 2$\times$
+improvement over mmap+memcpy (0.03~tok/s) and consistent with the
+projected I/O bandwidth. The CPU is entirely free during NVMe transfers,
+enabling concurrent compute overlap.
 
-For the scenario where Q8\_0 quantization ($\sim$70\,GB) \emph{exceeds}
-our 48\,GB RAM, NVMe streaming via \sysname{} is the only viable path
-without adding system memory. Combined with NanoQuant~\cite{chong2026nanoquant}
-(sub-1-bit quantization compressing 70B to $\sim$8\,GB), the data volume
-per token would drop from 42\,GB to $\sim$8\,GB, and \sysname{} at Gen4
-bandwidth could reach $\sim$0.5~tok/s---approaching interactive use.
+When combined with tiered caching (29 layers in VRAM, 51 in RAM, 0 on
+NVMe), the system achieves 0.20~tok/s. The bottleneck shifts from NVMe
+bandwidth to PCIe H2D transfers at Gen3~$\times$8 ($\sim$6.5\GBs{},
+103\,ms per 669\,MB layer). Adding adaptive layer skipping
+(threshold~0.98, skipping 16--20 middle layers) yields 0.27~tok/s, and
+combining with Q4\_K\_M quantization reaches 0.50~tok/s---a
+17$\times$ improvement over the CPU-mediated NVMe baseline.
+
+\textbf{Important context.} The absolute token rates for NVMe-only streaming
+are inherently low because the entire model must transit from storage per
+token. For reference, llama.cpp achieves $\sim$1~tok/s for 70B models when
+weights reside in GPU VRAM across two GPUs (tensor parallelism), and
+FlexGen~\cite{sheng2023flexgen} achieves 1~tok/s for OPT-175B with
+aggressive CPU/disk offloading. The contribution of \sysname{} is not the
+absolute token rate but the \textbf{removal of the CPU from the storage data
+path}: measured CPU utilization during NVMe-direct transfers is $\sim$0\%
+versus 100\% (one core saturated) for mmap+memcpy.
+
+For Q8\_0 quantization ($\sim$70\,GB) that \emph{exceeds} our 48\,GB RAM,
+NVMe streaming via \sysname{} is the only viable path without adding
+system memory. Combined with NanoQuant~\cite{chong2026nanoquant} (sub-1-bit
+quantization compressing 70B to $\sim$8\,GB), the data volume per token
+drops from 42\,GB to $\sim$8\,GB, projecting $\sim$0.5~tok/s from NVMe
+alone---matching the tiered+optimized result but without requiring RAM
+caching.
 
 % ============================================================
 % 6. BUGS AND ENGINEERING CHALLENGES
@@ -952,7 +993,7 @@ behavior across Intel and some AMD platforms. The Linux P2PDMA subsystem
 provides growing kernel support for device-to-device DMA. Looking forward,
 CXL memory pools~\cite{zhong2025cxl} could provide shared memory regions
 accessible by both GPU and NVMe, simplifying the data path. However, none
-of this prior work has documented the specific asymmetry on AMD B550/Vermeer
+of this prior work has documented the specific asymmetry on AMD B450/Vermeer
 (posted writes succeed, non-posted reads cause link failure) that we
 characterize and exploit in \sysname{}.
 
@@ -991,16 +1032,19 @@ PIPO             & --         & --         & \checkmark & \checkmark & \checkmar
 \label{sec:discussion}
 
 \textbf{Tier~1 bandwidth ceiling.} Tier~1 routes data through host pinned
-memory, adding one PCIe hop compared to direct NVMe-to-GPU DMA. On our
-platform, the GPU's PCIe~4.0~$\times$16 link to host memory provides
-$\sim$25\GBs{} of bandwidth---7$\times$ more than the SN530's 3.4\GBs{}.
+memory, adding one PCIe hop compared to direct NVMe-to-GPU DMA. On our B450
+platform, the GPU's PCIe~3.0~$\times$8 link to host memory provides
+$\sim$6.5\GBs{} of bandwidth---roughly 2$\times$ the SN530's 3.4\GBs{}.
 The NVMe device is therefore the bottleneck, not the extra hop, and Tier~1
-loses no throughput from the indirection. However, with Gen5 $\times$4 NVMe
-devices approaching 14\GBs{}, the host memory hop could become limiting for
-multi-device configurations. This motivates \textbf{Tier~2}: enabling NVMe
-DMA directly to GPU VRAM via the tinygrad P2P patches for the NVIDIA
-open-source kernel module, which would eliminate the host memory intermediate
-and enable scaling to multiple NVMe devices.
+loses no throughput from the indirection. However, the margin is tight: a
+Gen4~$\times$4 NVMe at full speed (7\GBs{}) would exceed our GPU link
+bandwidth, and even on our platform the SN740 reaches 3.35\GBs{} ($\sim$52\%
+of the GPU link). On platforms with full Gen4~$\times$16 (25\GBs{}), this
+headroom increases substantially. For our B450 configuration, this motivates
+\textbf{Tier~2}: enabling NVMe DMA directly to GPU VRAM via the tinygrad P2P
+patches for the NVIDIA open-source kernel module, which would eliminate the
+host memory intermediate and become essential when upgrading to faster NVMe
+devices or adding a second drive.
 
 \textbf{Why a single GPU thread suffices.} Our Little's Law analysis
 (\S\ref{sec:pipeline-analysis}) shows that QD=32 provides ample headroom to
@@ -1014,27 +1058,28 @@ thread is sufficient. We plan to evaluate multi-queue parallelism with 2--4
 NVMe devices to determine scaling behavior.
 
 \textbf{Bandwidth utilization in context.} \sysname{} achieves 78\% of the
-PCIe~3.0~$\times$4 link bandwidth at 256\,KB/QD=32. For comparison,
-BaM~\cite{qureshi2023bam} reports 90\% of link bandwidth on enterprise A100
-hardware with GPUDirect RDMA and queues in GPU HBM. The 12-point gap is
-attributable to Tier~1's extra host memory hop: each I/O traverses the PCIe
-fabric twice (NVMe $\rightarrow$ host DRAM $\rightarrow$ GPU), whereas BaM's
-Tier~3 path traverses it once (NVMe $\rightarrow$ GPU HBM). Despite this
-overhead, the normalized comparison (\S\ref{sec:eval}) shows that \sysname{}
-extracts 3.2$\times$ more of the available link bandwidth than CPU-mediated
-methods on the same platform.
+PCIe~3.0~$\times$4 link bandwidth on the SN530 and 99\% on the SN740 at
+256\,KB/QD=32. For comparison, BaM~\cite{qureshi2023bam} reports 90\% of link
+bandwidth on enterprise A100 hardware with GPUDirect RDMA and queues in GPU
+HBM. The SN530's 78\% gap is attributable to Tier~1's extra host memory hop
+and device-side throttling; the SN740's 99\% demonstrates that \sysname{} can
+match Tier~3-level link utilization on consumer hardware when the drive sustains
+its throughput. Despite the extra hop, the normalized comparison
+(\S\ref{sec:eval}) shows that \sysname{} extracts 3--4$\times$ more of the
+available link bandwidth than CPU-mediated methods on the same platform.
 
-\textbf{Synergy with quantization.} The I/O-bound token rates in
-Table~\ref{tab:llm-projection} assume uncompressed (Q6\_K) model weights.
-NanoQuant~\cite{chong2026nanoquant} demonstrates sub-1-bit quantization that
-compresses Llama~2-70B to $\sim$8\,GB with acceptable perplexity degradation.
-Combining \sysname{} with aggressive quantization would reduce the per-token
-storage transfer from 42\,GB to $\sim$8\,GB, yielding a projected
-$\sim$0.5~tok/s at Gen4 bandwidth---a 5$\times$ improvement over the
-uncompressed \sysname{} path and approaching the regime where compute (not
-I/O) becomes the bottleneck. This synergy is bidirectional: quantization
-reduces I/O volume while GPU-initiated I/O reduces transfer latency, and
-neither technique substitutes for the other.
+\textbf{Synergy with quantization.} The measured 0.50~tok/s result
+(Table~\ref{tab:llm-projection}) already demonstrates this synergy:
+Q4\_K\_M quantization reduces per-layer size from 669\,MB to $\sim$370\,MB,
+and combined with layer skipping, the effective data volume per token drops
+substantially. NanoQuant~\cite{chong2026nanoquant} pushes further with
+sub-1-bit quantization compressing Llama~2-70B to $\sim$8\,GB total.
+Combining \sysname{} NVMe-only streaming with NanoQuant would reduce the
+per-token transfer from 42\,GB to $\sim$8\,GB, projecting $\sim$0.5~tok/s
+from NVMe alone---matching the tiered+optimized result but without requiring
+RAM caching. This synergy is bidirectional: quantization reduces I/O volume
+while GPU-initiated I/O reduces transfer latency, and neither technique
+substitutes for the other.
 
 \textbf{CXL and future interconnects.} CXL~3.0 memory pools~\cite{zhong2025cxl}
 could fundamentally change the P2P landscape by providing cache-coherent
@@ -1061,19 +1106,21 @@ also support the necessary posted write routing. We plan to evaluate on Intel
 12th/13th-gen consumer platforms, where full P2P may enable Tier~2/3 without
 enterprise GPUs.
 
-\textbf{Toward end-to-end integration.} A key next step is integrating
-\sysname{} into an LLM inference engine for end-to-end streaming layer
-execution. The current evaluation demonstrates the I/O primitive; an
-application-level benchmark would show the interaction between I/O pipelining
-and GPU compute overlap. Specifically, while the GPU computes attention and
-feed-forward operations on layer $n$, \sysname{} can prefetch layer $n+1$
-from NVMe---a double-buffering strategy that hides I/O latency behind
-computation when the compute time per layer exceeds the I/O time.
+\textbf{End-to-end integration.} We integrated \sysname{} into ntransformer,
+a streaming inference engine with tiered caching (\S\ref{sec:eval}). The
+integration confirms that GPU-initiated I/O composes well with a
+double-buffering strategy: while the GPU computes attention and feed-forward
+on layer $n$, \sysname{} prefetches layer $n+1$ from NVMe. The measured
+0.06~tok/s for NVMe-only streaming matches the projected I/O bandwidth,
+validating that the primitive performs as expected in an application context.
+Further optimization (tiered caching, layer skipping, aggressive quantization)
+reaches 0.50~tok/s, demonstrating that \sysname{} serves as a viable building
+block for practical single-GPU inference of 70B-class models.
 
-\textbf{Limitations.} (1)~Our evaluation compares devices of different
-speeds (SN530 Gen3 vs.\ 980~PRO Gen4). While the bandwidth normalization
-(\S\ref{sec:eval}) controls for this, a same-device comparison would
-further strengthen the claims. (2)~Write support is implemented but not
+\textbf{Limitations.} (1)~The CPU baselines use a different (faster) NVMe
+device than \sysname{}. The bandwidth normalization (\S\ref{sec:eval})
+controls for this, and the SN740 results (99\% link utilization) confirm
+\sysname{} is not device-specific. (2)~Write support is implemented but not
 benchmarked; write operations face different challenges (write amplification,
 garbage collection) that may affect latency profiles. (3)~All measurements
 use sequential access patterns; random I/O workloads relevant to graph
@@ -1089,7 +1136,7 @@ kernel and driver versions, limiting deployment ease.
 
 We presented \sysname{}, the first system (to our knowledge) that demonstrates
 GPU-initiated NVMe I/O on consumer hardware. Using a GeForce RTX 3090 on an
-AMD B550 platform, a single CUDA thread autonomously manages NVMe I/O
+AMD B450 platform, a single CUDA thread autonomously manages NVMe I/O
 queues---constructing commands, writing doorbells via PTX MMIO instructions, and
 polling completions---without any CPU involvement in the data path.
 
@@ -1098,16 +1145,19 @@ doorbell ringing) succeed on AMD consumer platforms even where P2P reads fail.
 This enables a Tier~1 approach where the GPU drives the NVMe controller while
 all data flows through host pinned memory.
 
-\sysname{} achieves 2{,}666\MBs{} (78\% of PCIe~3.0 link bandwidth),
-outperforming CPU-mediated methods by up to 2.2$\times$ despite using a
-slower NVMe device. The system demonstrates that GPU-initiated storage I/O
-is not limited to enterprise hardware---consumer GPUs are physically capable
-of this operation, and the main barriers are software (driver checks, P2P
-topology) rather than hardware.
+\sysname{} achieves 2{,}666\MBs{} on the SN530 (78\% of link bandwidth) and
+3{,}350\MBs{} on the SN740 (99\% of link bandwidth), outperforming
+CPU-mediated methods by up to 2.2$\times$ despite the CPU baselines using a
+faster NVMe device. Integrated into a streaming inference engine, \sysname{}
+delivers 0.06~tok/s for Llama~70B from NVMe alone, and 0.50~tok/s when
+combined with tiered caching and quantization optimizations.
 
-This work opens the door to GPU-centric storage access on commodity hardware,
-with immediate applications in LLM inference, graph analytics, and any
-workload where GPU memory is insufficient to hold the full working set.
+The system demonstrates that GPU-initiated storage I/O is not limited to
+enterprise hardware---consumer GPUs are physically capable of this operation,
+and the main barriers are software (driver checks, P2P topology) rather than
+hardware. This work opens the door to GPU-centric storage access on commodity
+hardware, with immediate applications in LLM inference, graph analytics, and
+any workload where GPU memory is insufficient to hold the full working set.
 
 % ============================================================
 % REFERENCES

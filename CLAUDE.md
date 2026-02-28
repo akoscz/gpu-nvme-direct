@@ -19,7 +19,7 @@ actuar como procesador autonomo de I/O, emitiendo comandos NVMe directamente
 al controlador de almacenamiento via MMIO a traves del bus PCIe, **sin ninguna
 intervencion del CPU durante las operaciones de lectura**.
 
-Esto se logro en una plataforma AMD consumer (B550/Ryzen 5800X) donde:
+Esto se logro en una plataforma AMD consumer (B450/Ryzen 5800X) donde:
 - Los **writes PCIe peer-to-peer funcionan** (posted MemWr via AMD data fabric)
 - Los **reads PCIe peer-to-peer NO funcionan** (non-posted, AMD root complex los descarta)
 - Se usa un enfoque Tier 1: GPU escribe doorbells al NVMe, datos van a host pinned memory
@@ -95,7 +95,7 @@ obligatorio. gpu-nvme-direct es el unico camino viable sin ampliar RAM.
 |---|---|
 | GPU | NVIDIA RTX 3090 (GA102, sm_86, 24GB, Ampere) at 0000:0a:00.0 |
 | CPU | AMD Ryzen 7 5800X (Zen 3, 8C/16T, 3.8-4.7GHz) |
-| Plataforma | AMD B550, PCIe 4.0 (root ports CPU-direct) |
+| Plataforma | AMD B450 (GPU at Gen3 x8 due to M.2 lane sharing) |
 | RAM | 48GB DDR4-3200 |
 | NVMe test (VFIO) | WD SN530 1TB, 0000:0b:00.0, PCIe 3.0 x4, NVMe 1.4.0 |
 | NVMe sistema | Samsung 980 PRO 500GB, /dev/nvme0n1, PCIe 4.0 x4 |
@@ -107,11 +107,11 @@ obligatorio. gpu-nvme-direct es el unico camino viable sin ampliar RAM.
 ### Topologia PCIe
 ```
 Root Complex (AMD Matisse/Vermeer)
-+-- Root Port 03.1 -> GPU 0a:00.0     (PCIe 4.0 x16, CPU-direct)
-+-- Root Port 03.4 -> NVMe 0b:00.0    (PCIe 3.0 x4, via chipset B550)
++-- Root Port 03.1 -> GPU 0a:00.0     (PCIe 3.0 x8, CPU-direct, B450 lane sharing)
++-- Root Port 03.4 -> NVMe 0b:00.0    (PCIe 3.0 x4, via chipset B450)
 ```
 
-**IMPORTANTE**: El NVMe de test (SN530) esta conectado al chipset B550, no
+**IMPORTANTE**: El NVMe de test (SN530) esta conectado al chipset B450, no
 directamente al CPU. Esto introduce latencia adicional del fabric, pero el
 throughput de PCIe 3.0 x4 (~3.5 GB/s) es el factor limitante principal.
 
@@ -274,7 +274,7 @@ pasan al kernel GPU como arrays.
    (GeForce + AMD platform), sin ninguna dependencia de hardware enterprise.
 
 2. **Analisis de P2P en plataformas consumer**: Documentacion detallada de que
-   funciona y que no en AMD B550/Ryzen con GeForce RTX 3090.
+   funciona y que no en AMD B450/Ryzen con GeForce RTX 3090.
 
 3. **Tiered approach**: Propuesta de 3 niveles que degrada gracefully segun
    el soporte de P2P disponible.
