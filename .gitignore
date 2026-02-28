@@ -20,6 +20,22 @@ Module.symvers
 *.swo
 *~
 
+# LaTeX build artifacts
+*.aux
+*.log
+*.out
+*.bbl
+*.blg
+*.toc
+*.lof
+*.lot
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.nav
+*.snm
+*.vrb
+
 # OS
 .DS_Store
 Thumbs.db
@@ -29,13 +45,10 @@ __pycache__/
 *.pyc
 *.egg-info/
 venv/
+.venv/
 
 # Benchmark output
 *.csv
-*.png
-*.pdf
-!bench/plot_results.py
-!bench/bench_sweep.py
 
 # Kernel module build artifacts
 kmod/.tmp_versions/
@@ -44,3 +57,7 @@ kmod/*.mod.c
 kmod/*.cmd
 kmod/modules.order
 kmod/Module.symvers
+
+# Paper downloads (large files)
+papers/arxiv_*/source/
+papers/arxiv_*/*.tar.gz

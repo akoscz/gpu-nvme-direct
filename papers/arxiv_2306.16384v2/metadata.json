@@ -1,0 +1,52 @@
+{
+  "title": "GIDS: GNN-Informed Direct Storage Access for Training Graph Neural Networks on Large Graphs",
+  "authors": [
+    {
+      "name": "Jeongmin Brian Park",
+      "affiliation": "UIUC",
+      "email": "jpark346@illinois.edu"
+    },
+    {
+      "name": "Vikram Sharma Mailthody",
+      "affiliation": "NVIDIA",
+      "email": "vmailthody@nvidia.com"
+    },
+    {
+      "name": "Zaid Qureshi",
+      "affiliation": "NVIDIA",
+      "email": "zqureshi@nvidia.com"
+    },
+    {
+      "name": "Wen-mei Hwu",
+      "affiliation": "NVIDIA/UIUC",
+      "email": "whwu@nvidia.com"
+    }
+  ],
+  "arxiv_id": "2306.16384",
+  "version": "v2",
+  "categories": [
+    "cs.DC",
+    "cs.LG",
+    "cs.AR"
+  ],
+  "venue": "PVLDB (Proceedings of the VLDB Endowment) 2024",
+  "abstract": "Graph Neural Networks (GNNs) are emerging as a powerful tool for learning from graph-structured data and performing sophisticated inference tasks in various application domains. Although GNNs have been shown to be effective on modest-sized graphs, training them on large-scale graphs remains a significant challenge due to the lack of efficient storage access and caching methods for graph data. Existing frameworks for training GNNs use CPUs for graph sampling and feature aggregation, while the training and updating of model weights are executed on GPUs. However, our in-depth profiling shows CPUs cannot achieve the graph sampling and feature aggregation throughput required to keep up with GPUs. Furthermore, when the graph and its embeddings do not fit in the CPU memory, the overhead introduced by the operating system, say for handling page-faults, causes gross under-utilization of hardware and prolonged end-to-end execution time. To address these issues, we propose the GPU Initiated Direct Storage Access (GIDS) dataloader, to enable GPU-oriented GNN training for large-scale graphs while efficiently utilizing all hardware resources, such as CPU memory, storage, and GPU memory. The GIDS dataloader first addresses memory capacity constraints by enabling GPU threads to directly fetch feature vectors from storage. Then, we introduce a set of innovative solutions, including the dynamic storage access accumulator, constant CPU buffer, and GPU software cache with window buffering, to balance resource utilization across the entire system for improved end-to-end training throughput. Our evaluation using a single GPU on terabyte-scale GNN datasets shows that the GIDS dataloader accelerates the overall DGL GNN training pipeline by up to 582x when compared to the current, state-of-the-art DGL dataloader.",
+  "urls": {
+    "arxiv_abs": "https://arxiv.org/abs/2306.16384",
+    "arxiv_pdf": "https://arxiv.org/pdf/2306.16384",
+    "arxiv_eprint": "https://arxiv.org/e-print/2306.16384"
+  },
+  "datasets_evaluated": [
+    "IGB-Full (1084 GB, 269M nodes, homogeneous)",
+    "IGBH-Full (2773 GB, 547M nodes, heterogeneous)",
+    "ogbn-papers100M (77.4 GB, 111M nodes, homogeneous)",
+    "MAG240M (200 GB, 244M nodes, heterogeneous)"
+  ],
+  "key_systems": [
+    "BaM (Big-data Accelerator for Memory-mapped files)",
+    "DGL (Deep Graph Library)",
+    "NVIDIA A100 GPU (40GB HBM2)",
+    "Intel Optane NVMe SSD",
+    "Samsung 980 Pro NVMe SSD"
+  ]
+}

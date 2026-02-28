@@ -1,0 +1,1256 @@
+% gpu-nvme-direct: GPU-Initiated NVMe I/O on Consumer Hardware
+% Draft v0.2 — 2026-02-28
+
+\documentclass{article}
+\usepackage{arxiv}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{amsmath}
+\usepackage{subcaption}
+\usepackage{enumitem}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  citecolor=blue,
+  urlcolor=blue
+}
+
+% Code listing style
+\lstset{
+  language=C,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{blue}\bfseries,
+  commentstyle=\color{gray},
+  stringstyle=\color{red},
+  breaklines=true,
+  frame=single,
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  captionpos=b,
+  aboveskip=8pt,
+  belowskip=8pt,
+}
+
+\newcommand{\sysname}{\textsc{gpu-nvme-direct}}
+\newcommand{\us}{\,\text{\textmu s}}
+\newcommand{\MBs}{\,\text{MB/s}}
+\newcommand{\GBs}{\,\text{GB/s}}
+
+\title{\sysname{}: GPU-Initiated NVMe I/O on Consumer Hardware}
+
+\author{
+  Samuel Cortes \\
+  \texttt{https://naranjositos.tech/} \\
+  \texttt{https://github.com/xaskasdf/gpu-nvme-direct}
+}
+
+\date{February 2026}
+
+\begin{document}
+
+\maketitle
+
+% ============================================================
+% ABSTRACT
+% ============================================================
+\begin{abstract}
+
+We present \sysname{}, a system that enables a consumer GPU (NVIDIA GeForce RTX
+3090) to autonomously initiate NVMe storage I/O operations via PCIe MMIO,
+entirely without CPU involvement in the data path. Unlike prior work that
+requires enterprise GPUs with native peer-to-peer (P2P) DMA support,
+\sysname{} operates on commodity hardware (AMD Ryzen 5800X, B550 motherboard)
+costing approximately \$2{,}000, using a \emph{tiered approach} that degrades
+gracefully based on available P2P capabilities.
+
+The system works by having a single CUDA thread construct NVMe submission queue
+entries in host pinned memory, write doorbell registers on the NVMe
+controller's BAR0 via PTX \texttt{st.relaxed.mmio.sys} instructions, and poll
+completion queue entries---all without CPU intervention. This is possible
+because PCIe \emph{posted} Memory Write TLPs succeed through the AMD data
+fabric even on consumer platforms where non-posted reads fail.
+
+On a WD SN530 (PCIe~3.0~$\times$4), \sysname{} achieves 2{,}666\MBs{} at
+256\,KB block size with queue depth 32, reaching 78\% of the theoretical PCIe
+link bandwidth. Compared to CPU-mediated baselines using a faster Samsung 980
+PRO (PCIe~4.0~$\times$4), \sysname{} delivers up to 2.2$\times$ higher
+throughput at 16\,KB block size due to its ability to maintain 32 in-flight
+NVMe commands from a single GPU thread. We demonstrate the practical
+applicability of this approach for LLM inference, where streaming 70B model
+weights layer-by-layer from NVMe eliminates the CPU \texttt{memcpy} bottleneck
+in the data loading pipeline.
+
+\end{abstract}
+
+\keywords{GPU-initiated I/O \and NVMe \and PCIe peer-to-peer \and consumer hardware \and LLM inference \and storage access}
+
+% ============================================================
+% 1. INTRODUCTION
+% ============================================================
+\section{Introduction}
+\label{sec:intro}
+
+The explosive growth of large language models (LLMs) has created a fundamental
+tension between model size and available GPU memory. Models such as Llama~2
+70B~\cite{touvron2023llama2} require $\sim$70\,GB in FP16, or $\sim$42\,GB in
+Q6\_K quantization---far exceeding the 24\,GB VRAM of consumer GPUs like the
+NVIDIA RTX 3090. Running these models on consumer hardware requires
+\emph{streaming} model weights from storage to GPU memory, one layer at a time.
+
+The conventional data path for this streaming is CPU-mediated:
+\begin{center}
+\small
+NVMe $\xrightarrow{\text{DMA}}$ Page Cache $\xrightarrow{\text{CPU memcpy}}$
+Pinned Memory $\xrightarrow{\text{H2D DMA}}$ GPU VRAM
+\end{center}
+
+This pipeline introduces a fundamental bottleneck: the CPU must copy every byte
+of model data through its caches, consuming memory bandwidth and CPU cycles
+that could be used for other tasks. In practice, this limits throughput to
+$\sim$1.5--2\GBs{} and yields only 0.02~tokens/s for 70B models on consumer
+hardware.
+
+NVIDIA's GPUDirect Storage (GDS)~\cite{gds} addresses this by enabling direct
+DMA from NVMe to GPU memory, bypassing the CPU. However, GDS requires
+enterprise GPUs (Tesla, A-series, H-series) and certified storage hardware---a
+software stack explicitly unavailable on GeForce consumer GPUs. Prior academic
+work such as BaM~\cite{qureshi2023bam} demonstrated that GPUs can
+\emph{initiate} NVMe I/O operations autonomously, but again requires enterprise
+hardware with native PCIe peer-to-peer support.
+
+In this paper, we ask: \emph{Can a consumer GPU act as an autonomous I/O
+processor, directly driving an NVMe controller without any CPU involvement in
+the data path?}
+
+We answer this question affirmatively with \sysname{}, a system that enables
+GPU-initiated NVMe I/O on commodity hardware. Our key insight is that even on
+platforms where PCIe P2P reads fail (AMD consumer root complexes silently drop
+non-posted read TLPs), \emph{posted} PCIe Memory Write TLPs succeed---and
+writes are all that is needed for a GPU to drive an NVMe controller. The GPU
+writes NVMe command entries to host pinned memory, writes doorbell registers on
+the NVMe BAR0 via MMIO, and polls completion entries from host pinned memory.
+The NVMe controller independently DMAs data to/from host memory. The CPU is
+entirely uninvolved in the I/O data path.
+
+Our contributions are:
+
+\begin{enumerate}[leftmargin=*,topsep=2pt,itemsep=1pt]
+
+\item \textbf{First demonstration of GPU-initiated NVMe I/O on consumer
+  hardware.} We show that a GeForce RTX 3090 on an AMD B550 platform can
+  autonomously issue NVMe commands, achieving 2{,}666\MBs{} (78\% of PCIe~3.0
+  link bandwidth) without any CPU involvement in the data path.
+
+\item \textbf{Tiered architecture for heterogeneous P2P support.} We propose a
+  three-tier approach that degrades gracefully from full P2P (enterprise GPUs)
+  to write-only P2P (consumer AMD platforms), requiring no custom kernel
+  modules for Tier~1 operation.
+
+\item \textbf{Characterization of PCIe P2P behavior on AMD consumer
+  platforms.} We document the asymmetric P2P behavior of AMD B550/Vermeer:
+  posted writes succeed through the data fabric while non-posted reads are
+  silently dropped, and repeated failed reads cause NVMe link failure requiring
+  power cycle recovery.
+
+\item \textbf{Comprehensive evaluation against four baselines.} We compare
+  \sysname{} against CPU \texttt{memcpy}, CPU pinned transfer, and NVIDIA
+  cuFile (GDS) across block sizes from 4\,KB to 512\,KB and queue depths from
+  1 to 32, measuring throughput, latency, IOPS, and CPU utilization.
+
+\item \textbf{Practical LLM inference pipeline.} We demonstrate \sysname{}'s
+  applicability to streaming Llama~70B inference on a \$2{,}000 consumer
+  system, eliminating the CPU bottleneck in the weight-loading pipeline.
+
+\end{enumerate}
+
+% ============================================================
+% 2. BACKGROUND AND MOTIVATION
+% ============================================================
+\section{Background and Motivation}
+\label{sec:background}
+
+\subsection{NVMe Protocol Essentials}
+
+NVMe (Non-Volatile Memory Express)~\cite{nvme-spec} is a host controller
+interface for PCIe-attached solid-state storage. The protocol is based on
+\emph{submission queues} (SQs) and \emph{completion queues} (CQs) that reside
+in host memory:
+
+\begin{itemize}[leftmargin=*,topsep=2pt,itemsep=1pt]
+\item The \emph{host} writes 64-byte command entries into the SQ.
+\item The host writes the SQ \emph{tail doorbell} register on the controller's
+  BAR0 MMIO region to notify the controller of new commands.
+\item The \emph{controller} DMAs the command from the SQ, executes it, and
+  DMAs a 16-byte completion entry into the CQ.
+\item The host detects completions by polling a \emph{phase bit} in the CQ
+  entry that toggles on each queue wraparound.
+\item The host writes the CQ \emph{head doorbell} to signal consumed
+  completions.
+\end{itemize}
+
+For data transfers larger than a single page (4\,KB), NVMe uses
+\emph{Physical Region Page} (PRP) lists---arrays of physical page addresses
+that describe the scatter-gather list for the DMA transfer. For two-page
+transfers, PRP2 contains the second page address directly; for larger
+transfers, PRP2 points to a page-aligned list of physical addresses.
+
+Critically, NVMe makes no assumption about \emph{who} writes the SQ entries
+and doorbell registers. As long as the command format is correct and the
+doorbell value is valid, the controller will process the command regardless of
+whether a CPU or GPU (or any other bus master) wrote it.
+
+\subsection{PCIe Peer-to-Peer on Consumer Platforms}
+
+PCIe peer-to-peer (P2P) communication allows devices to communicate directly
+without routing transactions through system memory. P2P support varies
+significantly across platforms:
+
+\textbf{Intel Xeon / AMD EPYC:} Enterprise platforms generally support both
+posted (Memory Write) and non-posted (Memory Read) P2P transactions between
+PCIe devices.
+
+\textbf{AMD Consumer (B550/X570, Matisse/Vermeer):} The AMD data fabric
+forwards \emph{posted} Memory Write TLPs between root ports but \emph{does
+not} generate completions for non-posted Memory Read TLPs directed at peer
+devices. Read TLPs are silently dropped, causing Completion Timeout (CmpltTO)
+errors on the requesting device.
+
+\textbf{NVIDIA GeForce:} NVIDIA's proprietary driver disables P2P on consumer
+GPUs via capability checks in \texttt{libcuda.so}. However, the underlying
+hardware (GA102/RTX 3090) is physically capable of issuing PCIe posted writes
+through its GPU-visible mappings.
+
+This asymmetry---writes work, reads fail---is the foundation of our Tier~1
+approach.
+
+\subsection{GPU MMIO and PTX Instructions}
+
+Standard CUDA \texttt{volatile} pointer dereferences do not generate the
+correct PCIe transactions for MMIO access. The CUDA compiler may coalesce
+or reorder accesses through the GPU's L2 cache hierarchy. To guarantee
+correct PCIe BAR register access, we use PTX assembly instructions:
+
+\begin{lstlisting}[language={[x86masm]Assembler},caption={PTX MMIO instructions for PCIe BAR access},label={lst:ptx-mmio}]
+// Write: generates PCIe posted MemWr TLP
+st.relaxed.mmio.sys.u32 [addr], val;
+
+// Read: generates PCIe non-posted MemRd TLP
+ld.relaxed.mmio.sys.u32 val, [addr];
+\end{lstlisting}
+
+The \texttt{.mmio} qualifier ensures the access bypasses GPU caches and reaches
+the PCIe bus. The \texttt{.sys} qualifier provides system-scope visibility,
+ensuring the transaction is visible to all agents in the system (CPU, other
+GPUs, PCIe devices).
+
+To register NVMe BAR0 with the GPU's address space, we use
+\texttt{cudaHostRegisterIoMemory}, which on our kernel (6.17) required patching
+the NVIDIA open-source kernel module to fix a PFN resolution path broken by
+the removal of \texttt{follow\_pfn()} in Linux~6.12.
+
+\subsection{Motivation: LLM Inference from Storage}
+
+Consider inference with Llama~2 70B in Q6\_K quantization ($\sim$42\,GB,
+669\,MB per layer). With 24\,GB of VRAM, the entire model cannot reside in GPU
+memory. A \emph{Streaming Layer Execution Pipeline} (SLEP) reads one layer at a
+time from storage, executes the layer's attention and feed-forward computations
+on the GPU, then overwrites the layer buffer with the next layer.
+
+The current CPU-mediated pipeline achieves only $\sim$1.5--2\GBs{} effective
+throughput due to the double copy (mmap $\rightarrow$ CPU memcpy $\rightarrow$
+pinned staging $\rightarrow$ H2D DMA), yielding 0.02 tokens/s. By eliminating
+the CPU from the data path, \sysname{} achieves 2.1\GBs{} on a PCIe~3.0
+device, with projections of 4--6\GBs{} on PCIe~4.0 hardware, directly
+improving inference throughput.
+
+% ============================================================
+% 3. SYSTEM DESIGN
+% ============================================================
+\section{System Design}
+\label{sec:design}
+
+\subsection{Overview}
+
+\sysname{} enables a CUDA kernel running on a consumer GPU to autonomously
+manage NVMe I/O queues, submit read/write commands, and poll completions.
+Figure~\ref{fig:architecture} shows the system architecture.
+
+\begin{figure}[t]
+\centering
+\small
+\begin{verbatim}
+        GPU (RTX 3090)             NVMe (SN530)
+       +-------------+           +-----------+
+       | CUDA kernel | ==MMIO==> | BAR0      |
+       | (1 thread)  | doorbell  | registers |
+       |  sq_submit  | writes    |           |
+       |  cq_poll    |           +-----------+
+       +------+------+                |
+              |                       | DMA
+              v                       v
+       +------+------+           +-----------+
+       | Host pinned |  <==DMA== | NVMe DMA  |
+       | memory      |   data    | engine    |
+       | SQ/CQ/Data  |           |           |
+       +-------------+           +-----------+
+\end{verbatim}
+\caption{Tier~1 architecture. The GPU writes doorbell registers via MMIO
+  posted writes. All queues and data buffers reside in host pinned memory,
+  accessible to both the GPU (via PCIe) and the NVMe controller (via DMA).
+  The CPU is not involved in the I/O data path.}
+\label{fig:architecture}
+\end{figure}
+
+The system consists of two phases: a \emph{setup phase} (CPU-driven) and a
+\emph{data phase} (GPU-driven).
+
+\textbf{Setup phase (CPU):}
+\begin{enumerate}[leftmargin=*,topsep=2pt,itemsep=1pt]
+\item Map NVMe BAR0 via \texttt{mmap} of the sysfs resource file.
+\item Register BAR0 with the GPU via \texttt{cudaHostRegisterIoMemory}.
+\item Initialize the NVMe controller (disable, configure CC, enable, wait
+  for CSTS.RDY).
+\item Issue admin commands (Identify Controller, Identify Namespace).
+\item Create I/O submission and completion queues in host pinned memory.
+\item Allocate data buffers and build PRP lists using
+  \texttt{/proc/self/pagemap}.
+\item Populate a \texttt{gpu\_nvme\_queue} struct with all pointers and pass
+  it to the GPU kernel.
+\end{enumerate}
+
+\textbf{Data phase (GPU):}
+\begin{enumerate}[leftmargin=*,topsep=2pt,itemsep=1pt]
+\item Write a 64-byte SQ entry (NVMe Read command) to host pinned memory.
+\item Issue \texttt{\_\_threadfence\_system()} to ensure global visibility.
+\item Write the SQ tail doorbell to NVMe BAR0 via \texttt{st.relaxed.mmio.sys}.
+\item Issue \texttt{\_\_threadfence\_system()} to ensure the doorbell reaches PCIe.
+\item The NVMe controller asynchronously DMAs the SQ entry, executes the read,
+  DMAs data to the buffer, and writes a CQ entry.
+\item Poll the CQ entry's phase bit from host pinned memory.
+\item Write the CQ head doorbell to NVMe BAR0.
+\item Repeat from step~1 for the next command.
+\end{enumerate}
+
+\subsection{Tiered P2P Approach}
+
+We propose three tiers of operation that degrade gracefully based on the
+platform's PCIe P2P capabilities:
+
+\begin{description}[leftmargin=*,topsep=4pt,itemsep=2pt]
+\item[Tier 1 (Write-Only P2P):] SQ, CQ, and data buffers reside in host
+  pinned memory. The GPU writes doorbells to NVMe BAR0 (posted writes) and
+  reads SQ/CQ/data from host memory (no P2P reads needed). This tier works on
+  AMD consumer platforms where P2P reads fail. \emph{No custom kernel module
+  required.}
+
+\item[Tier 2 (Patched P2P):] SQ and CQ remain in host memory; data buffers
+  reside in GPU VRAM. The NVMe controller DMAs directly to GPU memory. This
+  requires patching the NVIDIA open-source kernel modules to enable P2P on
+  GeForce GPUs (similar to the tinygrad P2P patches).
+
+\item[Tier 3 (Native P2P):] All structures (SQ, CQ, data) reside in GPU VRAM.
+  This is the BaM~\cite{qureshi2023bam} approach, requiring enterprise GPUs
+  (Tesla/A-series) with native P2P DMA support.
+\end{description}
+
+\sysname{} currently implements Tier~1, which is sufficient to demonstrate
+GPU-autonomous I/O and achieve near-line-rate throughput.
+
+\subsection{Memory Ordering}
+
+Correct operation requires careful memory ordering between the GPU's write
+buffer, host DRAM, and the NVMe controller:
+
+\begin{lstlisting}[caption={Critical memory ordering sequence},label={lst:ordering}]
+// 1. Write SQ entry to host pinned memory
+sqe->opcode = 0x02;  // READ
+sqe->prp1 = data_phys;
+sqe->cdw10 = lba_low;
+// ... (all 16 dwords)
+
+// 2. Fence: ensure SQ writes reach DRAM
+__threadfence_system();
+
+// 3. Doorbell MMIO write to NVMe BAR0
+mmio_write32(doorbell, sq_tail);
+
+// 4. Fence: ensure doorbell reaches PCIe
+__threadfence_system();
+\end{lstlisting}
+
+Without the fence between steps 2 and 3, the NVMe controller may process the
+doorbell before the SQ entry is visible in host DRAM, causing it to read stale
+command data. The \texttt{\_\_threadfence\_system()} instruction provides
+system-scope ordering, ensuring all prior writes (to host pinned memory) are
+globally visible before the subsequent MMIO write (to NVMe BAR0) is issued.
+
+\subsection{Pipelined I/O}
+
+A single GPU thread can maintain multiple NVMe commands in flight
+simultaneously by submitting new commands before polling completions for
+previous ones. This is critical for saturating the NVMe device's bandwidth,
+as a single outstanding command at 4\,KB cannot keep the SSD busy during its
+internal parallelism (flash die interleaving, controller queuing).
+
+The benchmark kernel uses a \emph{pipeline fill} strategy:
+
+\begin{lstlisting}[caption={Pipelined I/O kernel (simplified)},label={lst:pipeline}]
+while (completed < num_ops) {
+  // Fill pipeline
+  while (submitted < num_ops &&
+         (submitted - completed) < pipe_depth) {
+    sq_submit_read(q, lba[submitted],
+                   nlb, prp1[slot], prp2[slot]);
+    submitted++;
+  }
+  // Poll for next completion (any CID)
+  cqr = cq_poll_completion(q, timeout);
+  if (cqr.success) completed++;
+}
+\end{lstlisting}
+
+At pipeline depth 32, the GPU thread maintains 32 outstanding NVMe commands.
+Each command's SQ entry occupies 64 bytes, and the total SQ footprint is only
+2\,KB---negligible relative to the data being transferred.
+
+\subsection{Queue Depth Analysis via Little's Law}
+\label{sec:pipeline-analysis}
+
+The effectiveness of our single-thread pipelined design can be understood through
+Little's Law: to saturate a device with bandwidth $B$ and per-command service
+time $t_s$, the required queue depth is $N = B \cdot t_s / s$, where $s$ is the
+block size. For the SN530 at 256\,KB blocks with $B = 3{,}400\MBs$ and
+$t_s \approx 75\us$ (measured single-command latency), the minimum queue depth is
+$N = 3{,}400 \times 75 / (256 \times 1{,}000) \approx 1.0$. At 4\,KB blocks,
+$N = 3{,}400 \times 10.6 / (4 \times 1{,}000) \approx 9.0$.
+
+This analysis explains three observed phenomena. First, \sysname{} at QD=32
+provides ample headroom for both block sizes, explaining why we achieve 78\% of
+link bandwidth. Second, CPU methods show no queue depth scaling
+(Table~\ref{tab:scaling}) because the kernel I/O stack serializes requests---the
+effective QD at the device is always $\sim$1 regardless of the application-level
+queue depth. Third, a \emph{single} GPU thread suffices because the pipeline
+management overhead (SQ entry construction + doorbell write + CQ poll) takes
+$\sim$2\us{} per command, far below the NVMe service time, leaving the thread
+idle in the CQ polling loop most of the time. Additional threads would provide
+negligible benefit unless the NVMe device's internal parallelism required higher
+queue depth (e.g., Gen5 devices with sub-microsecond latency).
+
+\subsection{PRP List Construction}
+
+For transfers larger than 4\,KB (one page), the NVMe controller needs
+physical addresses for each page of the destination buffer. We pre-build PRP
+(Physical Region Page) lists on the CPU during the setup phase:
+
+\begin{enumerate}[leftmargin=*,topsep=2pt,itemsep=1pt]
+\item Allocate a contiguous virtual buffer via \texttt{posix\_memalign} +
+  \texttt{mlock}.
+\item Register with CUDA via \texttt{cudaHostRegister} for GPU accessibility.
+\item Open \texttt{/proc/self/pagemap} and translate each virtual page to its
+  physical frame number (PFN).
+\item Build per-slot PRP lists: PRP1 = first page physical address; for
+  2-page transfers, PRP2 = second page address; for $>$2 pages, PRP2 = physical
+  address of a page-aligned list of physical addresses.
+\item Pass PRP1/PRP2 arrays to the GPU kernel as parameters.
+\end{enumerate}
+
+This design amortizes the costly pagemap translation over the entire benchmark
+run, keeping the GPU data-path overhead minimal.
+
+% ============================================================
+% 4. IMPLEMENTATION
+% ============================================================
+\section{Implementation}
+\label{sec:impl}
+
+\sysname{} is implemented in $\sim$4{,}500 lines of C and CUDA code (excluding
+benchmarks and tests), organized into GPU-side device code and CPU-side host
+code.
+
+\subsection{GPU-Side Components}
+
+\textbf{mmio\_ops.cuh}: Provides \texttt{mmio\_write32},
+\texttt{mmio\_read32}, and their 64-bit variants using PTX inline assembly.
+Under simulation (\texttt{GPUNVME\_USE\_SIM}), falls back to volatile pointer
+dereferences.
+
+\textbf{sq\_submit.cuh}: Constructs 64-byte NVMe Read/Write command entries
+directly in the submission queue. Each field is written as an aligned 32-bit
+or 64-bit word to avoid misaligned access penalties. CDW0 (containing the
+opcode and command ID) is written as a single atomic 32-bit store.
+
+\textbf{cq\_poll.cuh}: Implements phase-bit-based completion detection. Reads
+CQ DW3 (offset~12, naturally aligned) as a single 32-bit word, extracts the
+phase bit and command ID via bit shifts. Advances the CQ head pointer with
+wraparound and phase flip.
+
+\textbf{queue\_state.cuh}: Defines the \texttt{gpu\_nvme\_queue} struct that
+encapsulates all state needed by a GPU kernel to manage an NVMe I/O queue pair
+independently: SQ/CQ pointers, doorbell register pointers (BAR0 MMIO),
+queue dimensions, current tail/head positions, phase bit, and namespace
+information.
+
+\subsection{Host-Side Components}
+
+\textbf{controller.c}: Full NVMe controller initialization per the NVMe
+specification: disable controller (CC.EN=0), wait CSTS.RDY=0, configure admin
+queues (AQA, ASQ, ACQ), set CC (command set, page size, queue entry sizes),
+enable (CC.EN=1), wait CSTS.RDY=1, issue Identify Controller and Identify
+Namespace admin commands.
+
+\textbf{io\_queue.c}: Creates I/O queue pairs via admin commands (Create I/O CQ,
+Create I/O SQ). Allocates queue memory using \texttt{posix\_memalign} with
+\texttt{mlock} to guarantee page alignment (discovered that
+\texttt{cudaMallocHost}'s suballocator may return sub-page offsets, violating
+NVMe's page-alignment requirement for queue base addresses).
+
+\textbf{dma\_alloc.c}: Resolves virtual-to-physical address translation via
+\texttt{/proc/self/pagemap}. Provides PRP list allocation and construction
+for multi-page transfers.
+
+\textbf{bar\_map.c}: Maps NVMe BAR0 via \texttt{mmap} of the sysfs
+\texttt{resource0} file with \texttt{O\_SYNC} to ensure uncacheable access.
+Registers the mapping with the GPU via \texttt{cudaHostRegisterIoMemory |
+cudaHostRegisterMapped}.
+
+\subsection{NVIDIA Driver Patch}
+
+On Linux~6.17, \texttt{cudaHostRegisterIoMemory} fails because the NVIDIA
+open-source kernel module's PFN resolution path calls
+\texttt{nv\_follow\_pfn()}, which delegates to \texttt{follow\_pfn()}---a
+function removed in Linux~6.12 (commit \texttt{233eb0bf3b94}). The fallback
+\texttt{nv\_follow\_flavors()} unconditionally returns $-1$.
+
+We patched \texttt{os-mlock.c} to compute the PFN from the VMA's
+\texttt{vm\_pgoff} field for \texttt{VM\_PFNMAP} mappings:
+
+\begin{lstlisting}[caption={NVIDIA driver PFN resolution patch},label={lst:patch}]
+if (vma && (vma->vm_flags & VM_PFNMAP)) {
+    *pfn = vma->vm_pgoff +
+      ((address - vma->vm_start) >> PAGE_SHIFT);
+    return 0;
+}
+\end{lstlisting}
+
+This works because \texttt{io\_remap\_pfn\_range()} (used by PCI BAR mmap)
+stores the starting PFN in \texttt{vm\_pgoff} and creates contiguous mappings.
+The GPL-only \texttt{follow\_pfnmap\_start()} API cannot be used by the MIT-licensed
+NVIDIA module.
+
+\subsection{VFIO Device Setup}
+
+The test NVMe (WD SN530) is passed through to userspace via VFIO in
+no-IOMMU mode. After unbinding from the kernel NVMe driver and binding to
+\texttt{vfio-pci}, the device falls to D3 power state. We restore it to D0
+and re-enable Memory Space and Bus Master via \texttt{setpci}:
+
+\begin{lstlisting}[language=bash,caption={VFIO setup and power state recovery}]
+echo on > /sys/bus/pci/devices/$BDF/power/control
+setpci -s $BDF 0x84.W=0x0008  # Force D0
+setpci -s $BDF COMMAND=0x0006 # Mem+BusMaster
+\end{lstlisting}
+
+% ============================================================
+% 5. EVALUATION
+% ============================================================
+\section{Evaluation}
+\label{sec:eval}
+
+\subsection{Experimental Setup}
+
+Table~\ref{tab:hardware} summarizes our hardware configuration.
+
+\begin{table}[t]
+\centering
+\caption{Hardware configuration}
+\label{tab:hardware}
+\small
+\begin{tabular}{ll}
+\toprule
+\textbf{Component} & \textbf{Detail} \\
+\midrule
+GPU & NVIDIA RTX 3090 (GA102, 24\,GB, PCIe 4.0 $\times$16) \\
+CPU & AMD Ryzen 7 5800X (8C/16T, 3.8--4.7\,GHz) \\
+Platform & AMD B550, DDR4-3200 (48\,GB) \\
+NVMe (test) & WD SN530 1\,TB, PCIe 3.0 $\times$4 (VFIO) \\
+NVMe (system) & Samsung 980 PRO 500\,GB, PCIe 4.0 $\times$4 \\
+OS & Ubuntu 25.10 (kernel 6.17.0) \\
+CUDA & 13.1, Driver 590.48.01 (open, patched) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Note on device asymmetry.} The \sysname{} benchmarks use the WD SN530
+(PCIe~3.0~$\times$4, $\sim$3{,}400\MBs{} theoretical max) because it is the VFIO
+device. The CPU baselines (memcpy, pinned, cuFile) use the Samsung 980 PRO
+(PCIe~4.0~$\times$4, $\sim$7{,}000\MBs{} theoretical max) because the SN530 has no
+kernel device path. Despite this 2$\times$ asymmetry favoring the CPU baselines,
+\sysname{} outperforms them due to its ability to pipeline I/O operations.
+
+To enable fair comparison, we normalize throughput as a fraction of each device's
+theoretical PCIe link bandwidth. At 256\,KB/QD=32, \sysname{} achieves
+2{,}666/3{,}400 = \textbf{78.4\%} of its Gen3 link, while \texttt{cpu\_memcpy}
+achieves 1{,}731/7{,}000 = \textbf{24.7\%}, \texttt{cpu\_pinned} reaches
+1{,}409/7{,}000 = 20.1\%, and cuFile 1{,}396/7{,}000 = 19.9\%. The GPU-initiated
+path thus extracts 3.2$\times$ more of the available link bandwidth than
+CPU-mediated methods. This gap is explained by Little's Law
+(\S\ref{sec:pipeline-analysis}): saturating NVMe bandwidth requires
+$\text{QD} = \text{BW} \times \text{latency}$, and only \sysname{} maintains
+sufficient queue depth from the device's perspective.
+
+\textbf{Methodology:} Each configuration (block size $\times$ queue depth) is
+run 3 times. We measure per-completion latency using the GPU clock
+(\texttt{clock64()}), wall-clock time, and CPU utilization via
+\texttt{/proc/stat}. All tests use sequential access patterns. Block sizes
+range from 4\,KB to 512\,KB; queue depths from 1 to 32.
+
+\subsection{Throughput}
+
+Figure~\ref{fig:throughput-qd} shows throughput scaling with queue depth for
+each method.
+
+\begin{table}[t]
+\centering
+\caption{Throughput (MB/s) at QD=32 by block size. \sysname{} uses the
+  slower SN530; CPU baselines use the faster 980~PRO. Despite this, \sysname{}
+  achieves the highest throughput at all block sizes.}
+\label{tab:throughput}
+\small
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Block Size} & \textbf{gpu\_direct} & \textbf{cpu\_memcpy} & \textbf{cpu\_pinned} & \textbf{cuFile} \\
+\midrule
+4\,KB   & \textbf{336}   & 180  & 153  & 151 \\
+16\,KB  & \textbf{1{,}393} & 626  & 516  & 510 \\
+64\,KB  & \textbf{2{,}111} & 1{,}373 & 1{,}152 & 1{,}144 \\
+256\,KB & \textbf{2{,}666} & 1{,}731 & 1{,}409 & 1{,}396 \\
+512\,KB & \textbf{2{,}634} & 2{,}008 & 1{,}700 & 1{,}696 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Key finding 1: Queue depth scaling.} \sysname{} shows dramatic
+throughput improvement with queue depth: 2.0$\times$ at 4\,KB (173 to
+336\MBs{}) and 2.3$\times$ at 16\,KB (615 to 1{,}393\MBs{}). In contrast,
+CPU-mediated methods show \emph{no meaningful queue depth scaling}---their
+throughput is flat across QD=1 to QD=32 because the CPU serializes I/O
+operations through \texttt{memcpy}.
+
+\textbf{Key finding 2: Link bandwidth utilization.} At 256\,KB/QD=32, \sysname{}
+achieves 2{,}666\MBs{} on the SN530, which is 78\% of the device's theoretical
+PCIe~3.0~$\times$4 bandwidth ($\sim$3{,}400\MBs{}). The normalized comparison
+above shows that CPU methods utilize only 20--25\% of their faster Gen4 link,
+confirming that the GPU-initiated path is fundamentally more efficient at
+extracting device bandwidth.
+
+\textbf{Key finding 3: Advantage despite slower hardware.} Even though the
+CPU baselines use a 2$\times$ faster SSD, \sysname{} achieves 1.3--2.2$\times$
+higher throughput across all block sizes at QD=32. Per the Little's Law analysis
+(\S\ref{sec:pipeline-analysis}), this is because the CPU-mediated path
+effectively operates at QD=1 from the device's perspective, regardless of the
+application-level queue depth.
+
+\subsection{Queue Depth Scaling Factor}
+
+Table~\ref{tab:scaling} quantifies the scaling advantage. The GPU's ability to
+maintain 32 in-flight commands from a single thread is the fundamental
+differentiator.
+
+\begin{table}[t]
+\centering
+\caption{Throughput scaling factor (QD=32 / QD=1)}
+\label{tab:scaling}
+\small
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Block Size} & \textbf{gpu\_direct} & \textbf{cpu\_memcpy} & \textbf{cpu\_pinned} & \textbf{cuFile} \\
+\midrule
+4\,KB   & 1.95$\times$ & 1.08$\times$ & 0.96$\times$ & 1.01$\times$ \\
+16\,KB  & 2.27$\times$ & 1.00$\times$ & 0.98$\times$ & 1.00$\times$ \\
+64\,KB  & 1.41$\times$ & 1.10$\times$ & 0.98$\times$ & 1.00$\times$ \\
+256\,KB & 1.65$\times$ & 1.00$\times$ & 0.99$\times$ & 1.01$\times$ \\
+512\,KB & 1.98$\times$ & 1.02$\times$ & 1.00$\times$ & 0.99$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Latency}
+
+Table~\ref{tab:latency} shows median per-operation latency. At QD=1, each
+measurement represents the full NVMe round-trip; at QD=32, it measures the
+inter-completion gap (time between successive completions arriving at the CQ).
+
+\begin{table}[t]
+\centering
+\caption{Median latency (\us{}) for \sysname{}}
+\label{tab:latency}
+\small
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Block Size} & \textbf{QD=1} & \textbf{QD=4} & \textbf{QD=16} & \textbf{QD=32} \\
+\midrule
+4\,KB   & 10.6 & 1.70 & 1.49 & 1.50 \\
+16\,KB  & 14.2 & 15.5 & 1.48 & 1.47 \\
+64\,KB  & 29.0 & 33.4 & 13.0 & 14.0 \\
+256\,KB & 126  & 69   & 63   & 63 \\
+512\,KB & 412  & 154  & 141  & 141 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+At 4\,KB/QD=32, the inter-completion latency is only 1.5\us{}, demonstrating
+that the GPU's CQ polling loop is extremely efficient. The latency standard
+deviation at this configuration is 0.23\us{}, indicating highly consistent
+completion timing.
+
+At QD=1, \sysname{} achieves lower latency than CPU methods for small blocks
+(10.6\us{} vs. 19.6\us{} for \texttt{cpu\_memcpy} at 4\,KB), a 46\% reduction.
+This is because the GPU writes the doorbell directly via MMIO, avoiding the
+CPU's system call, I/O scheduler, and interrupt handling overhead.
+
+\subsection{CPU Utilization}
+
+\begin{table}[t]
+\centering
+\caption{CPU utilization (\%) across all configurations}
+\label{tab:cpu}
+\small
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Method} & \textbf{Mean} & \textbf{Min} & \textbf{Max} \\
+\midrule
+gpu\_direct  & 8.5  & 5.6  & 15.0 \\
+cpu\_memcpy  & 4.3  & 0.0  & 12.2 \\
+cpu\_pinned  & 4.7  & 0.0  & 12.5 \\
+cuFile       & 5.1  & 2.1  & 10.4 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The CPU utilization for \sysname{} (8.5\% average) reflects CUDA runtime
+overhead (kernel launch, synchronization), \emph{not} I/O data path work. The
+CPU is entirely free to perform other tasks (inference computation,
+preprocessing) during GPU-driven I/O. In contrast, the CPU methods block a
+thread on I/O completion, making that thread unavailable for computation
+despite showing lower aggregate CPU utilization across all 16 logical cores.
+
+\subsection{cuFile on Consumer Hardware}
+
+A notable finding is that NVIDIA cuFile (GPUDirect Storage API) performs
+identically to \texttt{cpu\_pinned} on our GeForce RTX 3090 hardware. Across
+all 60 configurations, the two methods differ by less than 3\% on average.
+This confirms that GDS falls back to a CPU-mediated path on consumer GPUs,
+providing no hardware acceleration. \sysname{} fills this gap by providing
+genuine GPU-initiated I/O on hardware that GDS does not support.
+
+\subsection{Large Sequential Reads}
+
+For the LLM inference use case, we measured throughput for large sequential
+reads representative of loading model layers:
+
+\begin{table}[t]
+\centering
+\caption{Large sequential read throughput (QD=32, 512\,KB blocks)}
+\label{tab:large-read}
+\small
+\begin{tabular}{lr}
+\toprule
+\textbf{Transfer Size} & \textbf{Throughput (MB/s)} \\
+\midrule
+4\,MB    & 2{,}122 \\
+128\,MB  & 2{,}734 (peak) \\
+669\,MB (1 Llama-70B Q6\_K layer) & 2{,}127 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The peak throughput of 2{,}734\MBs{} at 128\,MB demonstrates that \sysname{}
+can sustain near-optimal throughput for large sequential transfers. The slight
+drop at 669\,MB is due to thermal throttling of the SN530 during sustained reads.
+
+\subsection{Projected LLM Inference Performance}
+
+To contextualize the I/O throughput results for LLM inference, we project
+token-generation rates for Llama~2-70B in Q6\_K quantization ($\sim$42\,GB,
+80~layers, $\sim$669\,MB/layer). These projections assume I/O-bound
+layer-by-layer streaming where each token requires loading the full model
+from storage---the regime where the model \emph{exceeds} GPU VRAM and
+cannot be cached.
+
+\begin{table}[t]
+\centering
+\caption{Projected Llama-70B inference performance (I/O-bound regime,
+  model streamed from NVMe per token)}
+\label{tab:llm-projection}
+\small
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Data Path} & \textbf{BW} & \textbf{1 Layer} & \textbf{80 Layers} & \textbf{tok/s} \\
+\midrule
+mmap+memcpy (current)         & 1.5\GBs{} & 446\,ms & 35.7\,s & 0.028 \\
+\sysname{} (SN530 Gen3)       & 2.1\GBs{} & 319\,ms & 25.5\,s & 0.039 \\
+\sysname{} (peak)             & 2.7\GBs{} & 248\,ms & 19.8\,s & 0.050 \\
+\sysname{} (Gen4 $\times$4)   & 5.0\GBs{} & 134\,ms & 10.7\,s & 0.093 \\
+Warm page cache + H2D         & 13\GBs{}  &  51\,ms &  4.1\,s & 0.244 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Important context.} These token rates are inherently low because
+the entire 42\,GB model must transit from storage per token. For reference,
+llama.cpp achieves $\sim$1~tok/s for 70B models when weights reside in GPU
+VRAM across two GPUs (tensor parallelism), and FlexGen~\cite{sheng2023flexgen}
+achieves 1~tok/s for OPT-175B with aggressive CPU/disk offloading. The
+contribution of Table~\ref{tab:llm-projection} is not the absolute token
+rate---which is bounded by storage bandwidth---but the \textbf{relative
+improvement} of the I/O data path: \sysname{} delivers 1.4--3.3$\times$ higher
+throughput than CPU-mediated baselines for the same model and hardware.
+
+For the scenario where Q8\_0 quantization ($\sim$70\,GB) \emph{exceeds}
+our 48\,GB RAM, NVMe streaming via \sysname{} is the only viable path
+without adding system memory. Combined with NanoQuant~\cite{chong2026nanoquant}
+(sub-1-bit quantization compressing 70B to $\sim$8\,GB), the data volume
+per token would drop from 42\,GB to $\sim$8\,GB, and \sysname{} at Gen4
+bandwidth could reach $\sim$0.5~tok/s---approaching interactive use.
+
+% ============================================================
+% 6. BUGS AND ENGINEERING CHALLENGES
+% ============================================================
+\section{Engineering Challenges}
+\label{sec:bugs}
+
+Developing \sysname{} required solving several non-trivial challenges at the
+intersection of GPU programming, NVMe protocol, PCIe topology, and kernel
+driver internals. We document these for reproducibility.
+
+\begin{table}[t]
+\centering
+\caption{Critical bugs discovered and resolved}
+\label{tab:bugs}
+\small
+\begin{tabular}{clp{0.55\textwidth}}
+\toprule
+\textbf{\#} & \textbf{Bug} & \textbf{Root Cause \& Fix} \\
+\midrule
+1 & \texttt{cudaHostRegisterIoMemory} fails &
+    \texttt{follow\_pfn()} removed in kernel~6.12. Patched
+    \texttt{os-mlock.c}: compute PFN from \texttt{vm\_pgoff}. \\
+2 & GPU reads return \texttt{0xFFFFFFFF} &
+    AMD root complex drops non-posted P2P TLPs. Use Tier~1 (writes only). \\
+3 & Admin commands hang &
+    Admin CQ not page-aligned (\texttt{cudaMallocHost} suballocator).
+    Allocate $\geq$4096 bytes. \\
+4 & Pipeline depth $\geq$4 timeouts &
+    NVMe completions arrive out-of-order; poll discarded non-matching CQEs.
+    Use \texttt{cq\_poll\_completion} (accept any CID). \\
+5 & Post-warmup timeouts &
+    Resetting queue state while NVMe controller retains
+    internal pointers. Leave queue state rolling. \\
+6 & GPU reads crash NVMe link &
+    Accumulated CmpltTO errors from failed P2P reads. Avoid GPU reads;
+    power cycle to recover. \\
+7 & 64-bit MMIO write corruption &
+    Non-atomic 64-bit write to BAR0. Split into two 32-bit writes
+    (low word first per NVMe spec). \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Bug~\#4 deserves special attention. NVMe controllers may reorder completions
+within a queue---returning CQE for command $B$ before command $A$ even if $A$
+was submitted first. Our initial implementation used
+\texttt{cq\_poll\_for\_cid}, which discarded CQEs not matching the expected
+command ID. When the pipeline had multiple in-flight commands, this caused
+valid completions to be lost, leading to timeouts. The fix was to poll for
+\emph{any} completion (\texttt{cq\_poll\_completion}) and track which command
+IDs have completed, accepting completions in whatever order the NVMe
+controller delivers them.
+
+% ============================================================
+% 7. RELATED WORK
+% ============================================================
+\section{Related Work}
+\label{sec:related}
+
+\textbf{GPU-Initiated Storage Access.}
+BaM~\cite{qureshi2023bam} (ASPLOS~'23) is the closest prior work, demonstrating
+GPU-orchestrated on-demand storage access. BaM provisions NVMe queues directly
+in GPU HBM via GPUDirect RDMA and uses GPUDirect Async for doorbell writes,
+achieving 45.8M~IOPs across 10~SSDs. GIDS~\cite{park2024gids} (VLDB~'24)
+extends BaM to GNN training with a dynamic storage access accumulator and
+window buffering, reaching 582$\times$ speedup over DGL on terabyte-scale
+graphs. Both systems require enterprise GPUs (A100) with native P2P DMA
+support, PCIe expansion chassis, and custom kernel modules. \sysname{} differs
+fundamentally: it works on consumer hardware (\$2{,}000 vs.\ \$10{,}000+)
+where full P2P is unavailable, using only PCIe posted writes for doorbell
+access and host pinned memory for data staging.
+
+GPUfs~\cite{silberstein2014gpufs} pioneered GPU-initiated file I/O but routes
+all I/O through a CPU-side daemon. DRAGON~\cite{markthub2018dragon} extends GPU
+memory to NVM via page faults, introducing high per-fault latency.
+SPIN~\cite{bergman2017spin} integrates P2P DMA into the Linux page cache
+but requires PCIe switch topology and CPU-initiated I/O.
+Phoenix~\cite{phoenix2025} refactors the GDS I/O stack, mapping GPU memory into
+PCIe BAR space for direct NVMe access---but remains limited to enterprise GPUs.
+
+\textbf{GPUDirect Storage.}
+NVIDIA's GDS~\cite{gds} enables direct NVMe-to-GPU DMA; as of CUDA~12.8, it
+supports P2P DMA via the upstream kernel PCI P2PDMA infrastructure on x86\_64.
+However, GDS requires enterprise GPUs, certified storage, and the
+\texttt{nvidia-fs} kernel module. Our evaluation confirms that cuFile provides
+no benefit on GeForce hardware, falling back to a CPU-mediated path identical
+to \texttt{cpu\_pinned}.
+
+\textbf{Userspace NVMe Drivers.}
+SPDK~\cite{spdk} provides high-performance CPU-driven userspace NVMe access via
+polling. Our work extends the userspace NVMe concept to the GPU: instead of CPU
+cores polling SQ/CQ, a CUDA thread does. libnvm~\cite{markussen2021smartio}
+enables GPU DMA from NVMe but requires a kernel module and P2P-capable platforms.
+
+\textbf{LLM Inference on Constrained Hardware.}
+A rapidly growing body of work addresses LLM inference with limited GPU memory,
+all using CPU-mediated storage I/O:
+FlexGen~\cite{sheng2023flexgen} (ICML~'23) offloads weights, activations, and
+KV cache across GPU/CPU/disk using linear programming, achieving OPT-175B on a
+single 16\,GB GPU at 1~tok/s.
+PowerInfer~\cite{song2023powerinfer} (SOSP~'24) exploits activation sparsity
+(power-law neuron distribution) to preload hot neurons on GPU and compute cold
+neurons on CPU, reaching 11.69$\times$ over llama.cpp on RTX~4090.
+PIPO~\cite{liu2025pipo} designs a fine-grained offloading pipeline for consumer
+devices, increasing GPU utilization from $<$40\% to $>$90\% on RTX~3060.
+HeadInfer~\cite{luo2025headinfer} offloads KV cache to CPU RAM at per-attention-head
+granularity, enabling 4M-token inference with Llama~3-8B on a single RTX~4090.
+ServerlessLLM~\cite{fu2024serverlessllm} (OSDI~'24) exploits the full
+near-GPU storage hierarchy for fast checkpoint loading, achieving 12\GBs{}
+from RAID0-NVMe with optimized \texttt{O\_DIRECT} and pinned memory pipelining.
+InstInfer~\cite{instinfer2024} offloads attention computation to computational
+storage devices. DeepSpeed-Inference~\cite{aminabadi2022deepspeed} supports
+NVMe offloading via ZeRO-Infinity. LLM in a Flash~\cite{alizadeh2023llmflash}
+targets Apple's unified memory. NanoQuant~\cite{chong2026nanoquant} compresses
+LLMs to sub-1-bit levels, enabling Llama~2-70B on an 8\,GB consumer GPU---a
+technique complementary to \sysname{} that would dramatically reduce the data
+volume needing to be streamed from NVMe.
+
+None of these systems achieve \emph{GPU-initiated} storage access; all route
+I/O through the CPU. A recent I/O characterization study~\cite{cheops2025io}
+of LLM offloading to NVMe confirms that current frameworks do not saturate
+SSD bandwidth---model offloading is dominated by 128\,KiB sequential reads
+at well below device peak. \sysname{} addresses this gap by removing the CPU
+from the storage data path.
+
+\textbf{PCIe P2P and Interconnect Evolution.}
+Prior work on PCIe P2P~\cite{markussen2021smartio} has characterized P2P
+behavior across Intel and some AMD platforms. The Linux P2PDMA subsystem
+provides growing kernel support for device-to-device DMA. Looking forward,
+CXL memory pools~\cite{zhong2025cxl} could provide shared memory regions
+accessible by both GPU and NVMe, simplifying the data path. However, none
+of this prior work has documented the specific asymmetry on AMD B550/Vermeer
+(posted writes succeed, non-posted reads cause link failure) that we
+characterize and exploit in \sysname{}.
+
+\subsection{Positioning}
+
+Table~\ref{tab:comparison} positions \sysname{} against related systems.
+\sysname{} is the only system that combines GPU-initiated I/O with consumer
+hardware compatibility.
+
+\begin{table}[t]
+\centering
+\caption{Feature comparison with related systems}
+\label{tab:comparison}
+\small
+\begin{tabular}{lccccc}
+\toprule
+\textbf{System} & \rotatebox{60}{\textbf{GPU initiates}} & \rotatebox{60}{\textbf{No CPU data}} & \rotatebox{60}{\textbf{Consumer HW}} & \rotatebox{60}{\textbf{No kmod}} & \rotatebox{60}{\textbf{No ent. GPU}} \\
+\midrule
+\sysname{}       & \checkmark & \checkmark & \checkmark & \checkmark & \checkmark \\
+BaM              & \checkmark & \checkmark & --         & --         & -- \\
+GIDS             & \checkmark & \checkmark & --         & --         & -- \\
+GDS              & --         & \checkmark & --         & --         & -- \\
+SPDK             & --         & \checkmark & \checkmark & --         & N/A \\
+ServerlessLLM    & --         & --         & --         & \checkmark & \checkmark \\
+PowerInfer       & --         & --         & \checkmark & \checkmark & \checkmark \\
+FlexGen          & --         & --         & \checkmark & \checkmark & \checkmark \\
+PIPO             & --         & --         & \checkmark & \checkmark & \checkmark \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ============================================================
+% 8. DISCUSSION AND FUTURE WORK
+% ============================================================
+\section{Discussion and Future Work}
+\label{sec:discussion}
+
+\textbf{Tier~1 bandwidth ceiling.} Tier~1 routes data through host pinned
+memory, adding one PCIe hop compared to direct NVMe-to-GPU DMA. On our
+platform, the GPU's PCIe~4.0~$\times$16 link to host memory provides
+$\sim$25\GBs{} of bandwidth---7$\times$ more than the SN530's 3.4\GBs{}.
+The NVMe device is therefore the bottleneck, not the extra hop, and Tier~1
+loses no throughput from the indirection. However, with Gen5 $\times$4 NVMe
+devices approaching 14\GBs{}, the host memory hop could become limiting for
+multi-device configurations. This motivates \textbf{Tier~2}: enabling NVMe
+DMA directly to GPU VRAM via the tinygrad P2P patches for the NVIDIA
+open-source kernel module, which would eliminate the host memory intermediate
+and enable scaling to multiple NVMe devices.
+
+\textbf{Why a single GPU thread suffices.} Our Little's Law analysis
+(\S\ref{sec:pipeline-analysis}) shows that QD=32 provides ample headroom to
+saturate the SN530. The I/O management thread spends $\sim$2\us{} per command
+(SQ construction + doorbell write + fence), far below the device service time,
+and resides in a tight CQ polling loop otherwise. This consumes exactly one
+warp slot, leaving the remaining 81 SMs (on GA102) free for tensor computation.
+A multi-warp design managing multiple NVMe queues could provide higher
+aggregate throughput for multi-device setups, but for a single NVMe device, one
+thread is sufficient. We plan to evaluate multi-queue parallelism with 2--4
+NVMe devices to determine scaling behavior.
+
+\textbf{Bandwidth utilization in context.} \sysname{} achieves 78\% of the
+PCIe~3.0~$\times$4 link bandwidth at 256\,KB/QD=32. For comparison,
+BaM~\cite{qureshi2023bam} reports 90\% of link bandwidth on enterprise A100
+hardware with GPUDirect RDMA and queues in GPU HBM. The 12-point gap is
+attributable to Tier~1's extra host memory hop: each I/O traverses the PCIe
+fabric twice (NVMe $\rightarrow$ host DRAM $\rightarrow$ GPU), whereas BaM's
+Tier~3 path traverses it once (NVMe $\rightarrow$ GPU HBM). Despite this
+overhead, the normalized comparison (\S\ref{sec:eval}) shows that \sysname{}
+extracts 3.2$\times$ more of the available link bandwidth than CPU-mediated
+methods on the same platform.
+
+\textbf{Synergy with quantization.} The I/O-bound token rates in
+Table~\ref{tab:llm-projection} assume uncompressed (Q6\_K) model weights.
+NanoQuant~\cite{chong2026nanoquant} demonstrates sub-1-bit quantization that
+compresses Llama~2-70B to $\sim$8\,GB with acceptable perplexity degradation.
+Combining \sysname{} with aggressive quantization would reduce the per-token
+storage transfer from 42\,GB to $\sim$8\,GB, yielding a projected
+$\sim$0.5~tok/s at Gen4 bandwidth---a 5$\times$ improvement over the
+uncompressed \sysname{} path and approaching the regime where compute (not
+I/O) becomes the bottleneck. This synergy is bidirectional: quantization
+reduces I/O volume while GPU-initiated I/O reduces transfer latency, and
+neither technique substitutes for the other.
+
+\textbf{CXL and future interconnects.} CXL~3.0 memory pools~\cite{zhong2025cxl}
+could fundamentally change the P2P landscape by providing cache-coherent
+shared memory regions accessible to both GPU and NVMe controllers. In such
+architectures, \sysname{}'s Tier~1 host-memory approach would naturally
+benefit from the lower-latency CXL path. More importantly, CXL-attached
+NVMe devices could enable Tier~3-equivalent semantics on consumer platforms
+if the CXL fabric supports GPU-initiated transactions.
+
+\textbf{Safety and reliability.} Operating NVMe at the register level bypasses
+all kernel-level safety mechanisms. Bugs in command construction can cause
+data corruption or device hangs (Bug~\#6, Table~\ref{tab:bugs}). We mitigate
+this through a simulator mode (verifying logic without hardware),
+comprehensive struct layout tests, and careful power management. In
+production, a watchdog timer in the GPU kernel detects hangs (via
+\texttt{clock64()}) and returns error codes. A formal verification of the
+command construction path would further strengthen reliability.
+
+\textbf{Portability.} \sysname{}'s Tier~1 approach should work on any platform
+where the GPU can issue PCIe posted writes to a peer device's BAR. This
+includes AMD EPYC (full P2P), Intel Xeon (full P2P), and AMD consumer (posted
+writes only). Platforms with active PCIe switches (e.g., PLX/Broadcom) should
+also support the necessary posted write routing. We plan to evaluate on Intel
+12th/13th-gen consumer platforms, where full P2P may enable Tier~2/3 without
+enterprise GPUs.
+
+\textbf{Toward end-to-end integration.} A key next step is integrating
+\sysname{} into an LLM inference engine for end-to-end streaming layer
+execution. The current evaluation demonstrates the I/O primitive; an
+application-level benchmark would show the interaction between I/O pipelining
+and GPU compute overlap. Specifically, while the GPU computes attention and
+feed-forward operations on layer $n$, \sysname{} can prefetch layer $n+1$
+from NVMe---a double-buffering strategy that hides I/O latency behind
+computation when the compute time per layer exceeds the I/O time.
+
+\textbf{Limitations.} (1)~Our evaluation compares devices of different
+speeds (SN530 Gen3 vs.\ 980~PRO Gen4). While the bandwidth normalization
+(\S\ref{sec:eval}) controls for this, a same-device comparison would
+further strengthen the claims. (2)~Write support is implemented but not
+benchmarked; write operations face different challenges (write amplification,
+garbage collection) that may affect latency profiles. (3)~All measurements
+use sequential access patterns; random I/O workloads relevant to graph
+analytics~\cite{qureshi2023bam,park2024gids} remain unevaluated. (4)~The
+NVIDIA driver patch (\S\ref{sec:impl}) ties the system to specific
+kernel and driver versions, limiting deployment ease.
+
+% ============================================================
+% 9. CONCLUSION
+% ============================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+We presented \sysname{}, the first system (to our knowledge) that demonstrates
+GPU-initiated NVMe I/O on consumer hardware. Using a GeForce RTX 3090 on an
+AMD B550 platform, a single CUDA thread autonomously manages NVMe I/O
+queues---constructing commands, writing doorbells via PTX MMIO instructions, and
+polling completions---without any CPU involvement in the data path.
+
+Our key insight is that PCIe posted writes (the only operation needed for NVMe
+doorbell ringing) succeed on AMD consumer platforms even where P2P reads fail.
+This enables a Tier~1 approach where the GPU drives the NVMe controller while
+all data flows through host pinned memory.
+
+\sysname{} achieves 2{,}666\MBs{} (78\% of PCIe~3.0 link bandwidth),
+outperforming CPU-mediated methods by up to 2.2$\times$ despite using a
+slower NVMe device. The system demonstrates that GPU-initiated storage I/O
+is not limited to enterprise hardware---consumer GPUs are physically capable
+of this operation, and the main barriers are software (driver checks, P2P
+topology) rather than hardware.
+
+This work opens the door to GPU-centric storage access on commodity hardware,
+with immediate applications in LLM inference, graph analytics, and any
+workload where GPU memory is insufficient to hold the full working set.
+
+% ============================================================
+% REFERENCES
+% ============================================================
+\begin{thebibliography}{99}
+
+\bibitem{qureshi2023bam}
+Z.~Qureshi, V.~S.~Mailthody, I.~Gelado, S.~W.~Min, A.~Masood, J.~Park,
+J.~Xiong, C.~J.~Newburn, D.~Lopatenko, and W.~Hwu.
+\newblock {BaM}: A Case for Enabling Fine-grain High Throughput
+  {GPU}-Orchestrated Access to Storage.
+\newblock In {\em Proc.\ ASPLOS}, 2023.
+
+\bibitem{gds}
+{NVIDIA Corporation}.
+\newblock {GPUDirect Storage}.
+\newblock \url{https://docs.nvidia.com/gpudirect-storage/}, 2024.
+
+\bibitem{spdk}
+Z.~Yang, J.~R.~Harris, B.~Walker, D.~Verkamp, C.~Liu, C.~Chang, G.~Cao,
+J.~Stern, V.~Verma, and L.~E.~Paul.
+\newblock {SPDK}: A Development Kit to Build High Performance Storage
+  Applications.
+\newblock In {\em Proc.\ IEEE CloudCom}, 2017.
+
+\bibitem{markussen2021smartio}
+J.~Markussen, L.~B.~Kristiansen, P.~Halvorsen, H.~Kielland-Gyrud,
+H.~K.~Stensland, and C.~Griwodz.
+\newblock {SmartIO}: Zero-overhead Device Sharing through {PCIe} Networking.
+\newblock {\em ACM Trans.\ Comput.\ Syst.}, 2021.
+
+\bibitem{silberstein2014gpufs}
+M.~Silberstein, B.~Ford, I.~Keidar, and E.~Witchel.
+\newblock {GPUfs}: Integrating a File System with {GPUs}.
+\newblock {\em ACM Trans.\ Comput.\ Syst.}, 32(1), 2014.
+
+\bibitem{bergman2017spin}
+S.~Bergman, T.~Brokhman, T.~Cohen, and M.~Silberstein.
+\newblock {SPIN}: Seamless Operating System Integration of Peer-to-Peer {DMA}
+  Between {SSDs} and {GPUs}.
+\newblock In {\em Proc.\ USENIX ATC}, 2017.
+
+\bibitem{markthub2018dragon}
+P.~Markthub, M.~E.~Belviranli, S.~Lee, J.~S.~Vetter, and S.~Matsuoka.
+\newblock {DRAGON}: Breaking {GPU} Memory Capacity Limits with Direct {NVM}
+  Access.
+\newblock In {\em Proc.\ SC}, 2018.
+
+\bibitem{sheng2023flexgen}
+Y.~Sheng, L.~Zheng, B.~Yuan, Z.~Li, M.~Ryabinin, B.~Chen, P.~Liang,
+C.~Re, I.~Stoica, and C.~Zhang.
+\newblock {FlexGen}: High-Throughput Generative Inference of Large Language
+  Models with a Single {GPU}.
+\newblock In {\em Proc.\ ICML}, 2023.
+
+\bibitem{aminabadi2022deepspeed}
+R.~Y.~Aminabadi, S.~Rajbhandari, A.~A.~Awan, C.~Li, D.~Li, E.~Zheng,
+O.~Ruwase, S.~Smith, M.~Zhang, J.~Rasley, and Y.~He.
+\newblock {DeepSpeed-Inference}: Enabling Efficient Inference of Transformer
+  Models at Unprecedented Scale.
+\newblock In {\em Proc.\ SC}, 2022.
+
+\bibitem{kwon2023vllm}
+W.~Kwon, Z.~Li, S.~Zhuang, Y.~Sheng, L.~Zheng, C.~H.~Yu,
+J.~E.~Gonzalez, H.~Zhang, and I.~Stoica.
+\newblock Efficient Memory Management for Large Language Model Serving with
+  {PagedAttention}.
+\newblock In {\em Proc.\ SOSP}, 2023.
+
+\bibitem{song2023powerinfer}
+Y.~Song, Z.~Mi, H.~Xie, and H.~Chen.
+\newblock {PowerInfer}: Fast Large Language Model Serving with a Consumer-grade
+  {GPU}.
+\newblock In {\em Proc.\ SOSP}, 2024.
+
+\bibitem{alizadeh2023llmflash}
+K.~Alizadeh, I.~Mirzadeh, D.~Belenko, K.~Khatamifard, M.~Cho,
+C.~C.~Del~Mundo, M.~Rastegari, and M.~Farajtabar.
+\newblock {LLM} in a Flash: Efficient Large Language Model Inference with
+  Limited Memory.
+\newblock {\em arXiv:2312.11514}, 2023.
+
+\bibitem{park2024gids}
+J.~B.~Park, V.~S.~Mailthody, Z.~Qureshi, and W.~Hwu.
+\newblock Accelerating Sampling and Aggregation Operations in {GNN} Frameworks
+  with {GPU} Initiated Direct Storage Accesses.
+\newblock {\em Proc.\ VLDB Endow.}, 17(6):1227--1240, 2024.
+
+\bibitem{fu2024serverlessllm}
+Y.~Fu, L.~Xue, Y.~Huang, A.-O.~Brabete, D.~Ustiugov, Y.~Patel, and L.~Mai.
+\newblock {ServerlessLLM}: Low-Latency Serverless Inference for Large Language
+  Models.
+\newblock In {\em Proc.\ OSDI}, 2024.
+
+\bibitem{liu2025pipo}
+Y.~Liu, J.~Li, and W.-J.~Li.
+\newblock {PIPO}: Pipelined Offloading for Efficient Inference on Consumer
+  Devices.
+\newblock {\em arXiv:2504.03664}, 2025.
+
+\bibitem{luo2025headinfer}
+C.~Luo, C.~Cai, H.~Sun, J.~Xiao, B.~Yuan, W.~Xiao, J.~Hu, J.~Zhao,
+B.~Chen, and A.~Anandkumar.
+\newblock {HeadInfer}: Memory-Efficient {LLM} Inference by Head-wise
+  Offloading.
+\newblock {\em arXiv:2502.12574}, 2025.
+
+\bibitem{instinfer2024}
+{InstInfer}: In-Storage Attention Offloading for Cost-Effective Long-Context
+  {LLM} Inference.
+\newblock {\em arXiv:2409.04992}, 2024.
+
+\bibitem{chong2026nanoquant}
+H.~Chong, D.~Kim, C.~Kim, and M.~Choi.
+\newblock {NanoQuant}: Efficient Sub-1-Bit Quantization of Large Language
+  Models.
+\newblock {\em arXiv:2602.06694}, 2026.
+
+\bibitem{cheops2025io}
+{An I/O Characterizing Study of Offloading LLM Models and KV Caches to NVMe
+  SSD}.
+\newblock In {\em Proc.\ CHEOPS}, ACM, 2025.
+
+\bibitem{phoenix2025}
+{Phoenix}: A Refactored {I/O} Stack for {GPU} Direct Storage without Phony
+  Buffers.
+\newblock In {\em Proc.\ EuroSys}, ACM, 2025.
+
+\bibitem{zhong2025cxl}
+Y.~Zhong \emph{et al.}
+\newblock My {CXL} Pool Obviates Your {PCIe} Switch.
+\newblock In {\em Proc.\ OSDI}, 2025.
+
+\bibitem{nvme-spec}
+{NVM Express Workgroup}.
+\newblock NVM Express Base Specification, Revision 2.0.
+\newblock \url{https://nvmexpress.org/specifications/}, 2021.
+
+\bibitem{touvron2023llama2}
+H.~Touvron, L.~Martin, K.~Stone, P.~Albert, \emph{et al.}
+\newblock {Llama 2}: Open Foundation and Fine-Tuned Chat Models.
+\newblock {\em arXiv:2307.09288}, 2023.
+
+\end{thebibliography}
+
+\end{document}

@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>gpu-nvme-direct — Technical Report</title>
+  <meta name="description" content="Technical report: GPU-Initiated NVMe I/O on Consumer Hardware">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+  <div class="paper-layout">
+
+    <!-- Sidebar Navigation -->
+    <nav class="paper-nav" id="sidebar">
+      <div class="nav-title">Contents</div>
+      <a class="nav-home" href="index.html">&larr; Home</a>
+      <a href="#abstract" data-section="abstract">Abstract</a>
+      <a href="#introduction" data-section="introduction">1. Introduction</a>
+      <a href="#background" data-section="background">2. Background</a>
+      <a href="#design" data-section="design">3. System Design</a>
+      <a href="#implementation" data-section="implementation">4. Implementation</a>
+      <a href="#evaluation" data-section="evaluation">5. Evaluation</a>
+      <a href="#bugs" data-section="bugs">6. Engineering Challenges</a>
+      <a href="#related" data-section="related">7. Related Work</a>
+      <a href="#discussion" data-section="discussion">8. Discussion</a>
+      <a href="#conclusion" data-section="conclusion">9. Conclusion</a>
+      <a href="#references" data-section="references">References</a>
+    </nav>
+
+    <!-- Main content -->
+    <div class="paper-main">
+
+      <!-- Header -->
+      <header class="paper-header">
+        <h1>gpu-nvme-direct: GPU-Initiated NVMe I/O on Consumer Hardware</h1>
+        <p class="paper-meta">
+          <strong>Samuel Cortes</strong> &middot; February 2026<br>
+          Code: <a href="https://github.com/xaskasdf/gpu-nvme-direct">github.com/xaskasdf/gpu-nvme-direct</a>
+          &middot; <a href="https://naranjositos.tech/">naranjositos.tech</a>
+        </p>
+      </header>
+
+      <div class="paper-content">
+
+        <!-- Abstract -->
+        <section id="abstract">
+          <h2>Abstract</h2>
+          <p>We present <strong>gpu-nvme-direct</strong>, a system that enables a consumer GPU (NVIDIA GeForce RTX 3090) to autonomously initiate NVMe storage I/O operations via PCIe MMIO, entirely without CPU involvement in the data path. Unlike prior work that requires enterprise GPUs with native peer-to-peer (P2P) DMA support, gpu-nvme-direct operates on commodity hardware (AMD Ryzen 5800X, B550 motherboard) costing approximately $2,000, using a <em>tiered approach</em> that degrades gracefully based on available P2P capabilities.</p>
+          <p>The system works by having a single CUDA thread construct NVMe submission queue entries in host pinned memory, write doorbell registers on the NVMe controller's BAR0 via PTX <code>st.relaxed.mmio.sys</code> instructions, and poll completion queue entries &mdash; all without CPU intervention. This is possible because PCIe <em>posted</em> Memory Write TLPs succeed through the AMD data fabric even on consumer platforms where non-posted reads fail.</p>
+          <p>On a WD SN530 (PCIe 3.0 x4), gpu-nvme-direct achieves 2,666 MB/s at 256 KB block size with queue depth 32, reaching 78% of the theoretical PCIe link bandwidth. Compared to CPU-mediated baselines using a faster Samsung 980 PRO (PCIe 4.0 x4), gpu-nvme-direct delivers up to 2.2x higher throughput at 16 KB block size due to its ability to maintain 32 in-flight NVMe commands from a single GPU thread.</p>
+        </section>
+
+        <!-- 1. Introduction -->
+        <section id="introduction">
+          <h2>1. Introduction</h2>
+          <p>The explosive growth of large language models (LLMs) has created a fundamental tension between model size and available GPU memory. Models such as Llama 2 70B require ~70 GB in FP16, or ~42 GB in Q6_K quantization &mdash; far exceeding the 24 GB VRAM of consumer GPUs like the NVIDIA RTX 3090. Running these models on consumer hardware requires <em>offloading</em>: streaming model weights from slower storage tiers (CPU RAM, NVMe SSD) to the GPU during inference.</p>
+          <p>Current offloading frameworks (llama.cpp, FlexGen, PowerInfer, PIPO) all route storage I/O through the CPU: the CPU reads data from the NVMe drive into system memory, then copies it to GPU memory via PCIe. This architecture has two fundamental limitations:</p>
+          <ol>
+            <li>The CPU becomes a bottleneck in the data path, serializing I/O operations that could otherwise be pipelined.</li>
+            <li>CPU cores used for I/O are unavailable for other tasks (preprocessing, scheduling, serving multiple requests).</li>
+          </ol>
+          <p>We ask: <em>can the GPU itself directly initiate NVMe I/O on consumer hardware?</em></p>
+          <p>Prior work (BaM, GIDS) has demonstrated GPU-initiated storage access, but exclusively on enterprise hardware (NVIDIA A100, GPUDirect RDMA, PCIe expansion chassis) costing $10,000+. No prior system has achieved GPU-initiated NVMe I/O on commodity consumer hardware.</p>
+          <p>Our contributions:</p>
+          <ol>
+            <li><strong>First demonstration</strong> of GPU-initiated NVMe I/O on consumer hardware (RTX 3090, AMD B550).</li>
+            <li><strong>Characterization</strong> of the PCIe posted-write asymmetry on AMD consumer platforms.</li>
+            <li><strong>A tiered P2P architecture</strong> that degrades gracefully from native P2P (enterprise) to write-only P2P (consumer).</li>
+            <li><strong>Comprehensive evaluation</strong> showing 2.2x throughput advantage over CPU-mediated methods.</li>
+          </ol>
+        </section>
+
+        <!-- 2. Background -->
+        <section id="background">
+          <h2>2. Background and Motivation</h2>
+
+          <h3>2.1 NVMe Protocol Essentials</h3>
+          <p>NVMe is a register-level interface for accessing storage over PCIe. The host communicates with the NVMe controller through <em>submission queues</em> (SQ) and <em>completion queues</em> (CQ) residing in host memory. To issue a command, the host writes a 64-byte submission queue entry (SQE), then rings the SQ doorbell by writing to a register in the controller's BAR0 MMIO space. The controller fetches the SQE via DMA, executes the command, DMAs data to/from the host buffer, and writes a completion queue entry (CQE) to host memory.</p>
+
+          <h3>2.2 PCIe Peer-to-Peer on Consumer Platforms</h3>
+          <p>PCIe P2P allows one device to directly access another device's memory or registers without CPU involvement. On enterprise platforms (AMD EPYC, Intel Xeon with PLX switches), P2P is well-supported. On AMD consumer platforms (B550, X570), P2P behavior is asymmetric:</p>
+          <ul>
+            <li><strong>Posted writes (Memory Write TLPs):</strong> GPU &rarr; NVMe BAR0 succeeds. The AMD data fabric routes these correctly.</li>
+            <li><strong>Non-posted reads (Memory Read TLPs):</strong> GPU &rarr; NVMe BAR0 fails. The root complex drops these, returning 0xFFFFFFFF.</li>
+          </ul>
+          <p>This asymmetry is the key insight enabling gpu-nvme-direct: NVMe doorbells are <em>write-only</em> registers, so posted writes are sufficient to drive the controller.</p>
+
+          <h3>2.3 GPU MMIO and PTX Instructions</h3>
+          <p>NVIDIA GPUs can access host-mapped memory regions via PTX instructions. For MMIO (memory-mapped I/O), the critical instructions are:</p>
+          <ul>
+            <li><code>st.relaxed.mmio.sys</code> &mdash; Store to MMIO space with system scope, generating a PCIe posted write.</li>
+            <li><code>ld.relaxed.mmio.sys</code> &mdash; Load from MMIO space with system scope, generating a PCIe non-posted read (fails on consumer AMD P2P).</li>
+          </ul>
+
+          <h3>2.4 Motivation: LLM Inference from Storage</h3>
+          <p>For Llama 2 70B in Q6_K quantization (~42 GB, 80 layers, ~669 MB/layer), each token generation requires reading the entire model if it doesn't fit in GPU VRAM. At current NVMe speeds (2&ndash;7 GB/s), this takes 6&ndash;21 seconds per token. Removing the CPU from the data path reduces this time by pipelining I/O operations with higher queue depth utilization.</p>
+        </section>
+
+        <!-- 3. System Design -->
+        <section id="design">
+          <h2>3. System Design</h2>
+
+          <h3>3.1 Overview</h3>
+          <p>The system consists of a <em>setup phase</em> (CPU-driven) and a <em>data phase</em> (GPU-driven). During setup, the CPU initializes the NVMe controller, creates I/O queues in host pinned memory, builds PRP lists, and passes all state to the GPU kernel. During the data phase, the GPU thread autonomously manages all I/O.</p>
+
+          <h3>3.2 Tiered P2P Approach</h3>
+          <ul>
+            <li><strong>Tier 1 (Write-Only P2P):</strong> SQ, CQ, and data buffers in host pinned memory. GPU writes doorbells to NVMe BAR0. Works on AMD consumer. <em>No custom kernel module.</em></li>
+            <li><strong>Tier 2 (Patched P2P):</strong> Data buffers in GPU VRAM. NVMe DMA directly to GPU. Requires tinygrad P2P patches.</li>
+            <li><strong>Tier 3 (Native P2P):</strong> Everything in GPU HBM. The BaM approach. Requires enterprise GPUs.</li>
+          </ul>
+
+          <h3>3.3 Memory Ordering</h3>
+          <p>Correct operation requires <code>__threadfence_system()</code> between SQ entry writes and doorbell writes, ensuring the NVMe controller sees consistent command data when it fetches the SQE via DMA.</p>
+
+          <h3>3.4 Pipelined I/O</h3>
+          <p>A single GPU thread maintains up to 32 NVMe commands in flight simultaneously. New commands are submitted before completions for previous ones arrive, keeping the NVMe device's internal parallelism (flash die interleaving) fully utilized.</p>
+
+          <h3>3.5 Queue Depth Analysis via Little's Law</h3>
+          <p>To saturate a device with bandwidth <em>B</em> and per-command service time <em>t<sub>s</sub></em>, the required queue depth is <em>N = B &middot; t<sub>s</sub> / s</em>. For the SN530 at 256 KB blocks: N &asymp; 1.0. At 4 KB blocks: N &asymp; 9.0. QD=32 provides ample headroom for all block sizes. CPU methods show no queue depth scaling because the kernel I/O stack serializes requests &mdash; the effective QD at the device is always ~1.</p>
+        </section>
+
+        <!-- 4. Implementation -->
+        <section id="implementation">
+          <h2>4. Implementation</h2>
+          <p>gpu-nvme-direct is implemented in ~4,500 lines of C and CUDA code. Key components:</p>
+          <ul>
+            <li><strong>mmio_ops.cuh:</strong> PTX inline assembly for <code>mmio_write32</code>, <code>mmio_read32</code>, and 64-bit variants.</li>
+            <li><strong>sq_submit.cuh:</strong> Constructs 64-byte NVMe Read/Write SQEs with aligned 32-bit stores.</li>
+            <li><strong>cq_poll.cuh:</strong> Phase-bit-based completion detection from host pinned memory.</li>
+            <li><strong>controller.c:</strong> Full NVMe controller initialization per NVMe spec 2.0.</li>
+            <li><strong>dma_alloc.c:</strong> Virtual-to-physical translation via <code>/proc/self/pagemap</code> for PRP lists.</li>
+          </ul>
+          <p><strong>NVIDIA Driver Patch:</strong> On Linux 6.17, <code>cudaHostRegisterIoMemory</code> fails because <code>follow_pfn()</code> was removed in kernel 6.12. We patched the NVIDIA open-source kernel module to compute the PFN from the VMA's <code>vm_pgoff</code> for <code>VM_PFNMAP</code> mappings.</p>
+          <p><strong>VFIO Setup:</strong> The test NVMe (SN530) is passed through to userspace via VFIO in no-IOMMU mode. After VFIO binding, we restore D0 power state and re-enable Memory Space + Bus Master via <code>setpci</code>.</p>
+        </section>
+
+        <!-- 5. Evaluation -->
+        <section id="evaluation">
+          <h2>5. Evaluation</h2>
+
+          <h3>5.1 Throughput at QD=32</h3>
+          <p>gpu-nvme-direct uses the slower SN530 (Gen3, ~3,400 MB/s max); CPU baselines use the faster 980 PRO (Gen4, ~7,000 MB/s max). Despite this 2x asymmetry favoring baselines:</p>
+          <table>
+            <thead><tr><th>Block Size</th><th>gpu_direct</th><th>cpu_memcpy</th><th>cpu_pinned</th><th>cuFile</th></tr></thead>
+            <tbody>
+              <tr><td>4 KB</td><td><strong>336</strong></td><td>180</td><td>153</td><td>151</td></tr>
+              <tr><td>16 KB</td><td><strong>1,393</strong></td><td>626</td><td>516</td><td>510</td></tr>
+              <tr><td>64 KB</td><td><strong>2,111</strong></td><td>1,373</td><td>1,152</td><td>1,144</td></tr>
+              <tr><td>256 KB</td><td><strong>2,666</strong></td><td>1,731</td><td>1,409</td><td>1,396</td></tr>
+              <tr><td>512 KB</td><td><strong>2,634</strong></td><td>2,008</td><td>1,700</td><td>1,696</td></tr>
+            </tbody>
+          </table>
+          <p>Normalized: gpu_direct achieves <strong>78.4%</strong> of Gen3 link; cpu_memcpy achieves only <strong>24.7%</strong> of Gen4 link. The GPU path extracts 3.2x more available bandwidth.</p>
+
+          <h3>5.2 Queue Depth Scaling</h3>
+          <p>gpu-nvme-direct shows 1.4&ndash;2.3x throughput improvement from QD=1 to QD=32. CPU methods show <em>no meaningful scaling</em> (1.0x) because the kernel serializes I/O.</p>
+
+          <h3>5.3 Latency</h3>
+          <p>At 4 KB/QD=32, the inter-completion latency is only 1.5 &mu;s (std dev: 0.23 &mu;s). At QD=1, gpu-nvme-direct achieves 10.6 &mu;s vs 19.6 &mu;s for cpu_memcpy &mdash; a 46% reduction by bypassing the kernel I/O stack.</p>
+
+          <h3>5.4 CPU Utilization</h3>
+          <p>gpu-nvme-direct: 8.5% average (CUDA runtime overhead only). The CPU is entirely free for other tasks during GPU-driven I/O.</p>
+
+          <h3>5.5 cuFile on Consumer Hardware</h3>
+          <p>NVIDIA cuFile (GPUDirect Storage) performs identically to cpu_pinned on GeForce RTX 3090, confirming GDS falls back to a CPU-mediated path on consumer GPUs. gpu-nvme-direct fills this gap.</p>
+
+          <h3>5.6 LLM Inference Projections</h3>
+          <table>
+            <thead><tr><th>Data Path</th><th>BW</th><th>80 Layers</th><th>tok/s</th></tr></thead>
+            <tbody>
+              <tr><td>mmap+memcpy</td><td>1.5 GB/s</td><td>35.7 s</td><td>0.028</td></tr>
+              <tr><td>gpu-nvme-direct (Gen3)</td><td>2.1 GB/s</td><td>25.5 s</td><td>0.039</td></tr>
+              <tr><td>gpu-nvme-direct (Gen4)</td><td>5.0 GB/s</td><td>10.7 s</td><td><strong>0.093</strong></td></tr>
+            </tbody>
+          </table>
+          <p>These are I/O-bound projections for streaming the full 42 GB model per token. The contribution is the <strong>relative improvement</strong> (1.4&ndash;3.3x), not the absolute rate. Combined with NanoQuant (sub-1-bit quantization, ~8 GB), projected ~0.5 tok/s at Gen4.</p>
+        </section>
+
+        <!-- 6. Engineering Challenges -->
+        <section id="bugs">
+          <h2>6. Engineering Challenges</h2>
+          <p>Seven critical bugs discovered during development:</p>
+          <table>
+            <thead><tr><th>#</th><th>Bug</th><th>Root Cause &amp; Fix</th></tr></thead>
+            <tbody>
+              <tr><td>1</td><td><code>cudaHostRegisterIoMemory</code> fails</td><td><code>follow_pfn()</code> removed in kernel 6.12. Patched <code>os-mlock.c</code>.</td></tr>
+              <tr><td>2</td><td>GPU reads return 0xFFFFFFFF</td><td>AMD root complex drops non-posted P2P TLPs. Use Tier 1.</td></tr>
+              <tr><td>3</td><td>Admin commands hang</td><td>Admin CQ not page-aligned. Allocate &ge;4096 bytes.</td></tr>
+              <tr><td>4</td><td>Pipeline depth &ge;4 timeouts</td><td>NVMe completions out-of-order. Accept any CID.</td></tr>
+              <tr><td>5</td><td>Post-warmup timeouts</td><td>Queue state reset while controller retains pointers.</td></tr>
+              <tr><td>6</td><td>GPU reads crash NVMe link</td><td>Accumulated CmpltTO errors. Avoid reads; power cycle.</td></tr>
+              <tr><td>7</td><td>64-bit MMIO corruption</td><td>Non-atomic write. Split into two 32-bit writes.</td></tr>
+            </tbody>
+          </table>
+        </section>
+
+        <!-- 7. Related Work -->
+        <section id="related">
+          <h2>7. Related Work</h2>
+
+          <h3>GPU-Initiated Storage Access</h3>
+          <p><strong>BaM</strong> (ASPLOS '23) demonstrates GPU-orchestrated on-demand storage via GPUDirect RDMA on A100 GPUs, achieving 45.8M IOPs across 10 SSDs. <strong>GIDS</strong> (VLDB '24) extends BaM to GNN training, reaching 582x speedup over DGL. Both require enterprise hardware ($10k+). gpu-nvme-direct works on consumer hardware (~$2k) using only PCIe posted writes.</p>
+
+          <h3>LLM Inference on Constrained Hardware</h3>
+          <p><strong>FlexGen</strong> (ICML '23) offloads across GPU/CPU/disk via linear programming. <strong>PowerInfer</strong> (SOSP '24) exploits activation sparsity. <strong>PIPO</strong> designs fine-grained offloading for consumer devices. <strong>HeadInfer</strong> offloads KV cache at per-head granularity. <strong>ServerlessLLM</strong> (OSDI '24) optimizes checkpoint loading to 12 GB/s from RAID0-NVMe. None achieve GPU-initiated storage access &mdash; all route I/O through the CPU.</p>
+
+          <h3>Positioning</h3>
+          <table>
+            <thead><tr><th>System</th><th>GPU initiates</th><th>No CPU data</th><th>Consumer HW</th><th>No kmod</th></tr></thead>
+            <tbody>
+              <tr><td><strong>gpu-nvme-direct</strong></td><td><strong>&check;</strong></td><td><strong>&check;</strong></td><td><strong>&check;</strong></td><td><strong>&check;</strong></td></tr>
+              <tr><td>BaM</td><td>&check;</td><td>&check;</td><td>&mdash;</td><td>&mdash;</td></tr>
+              <tr><td>GIDS</td><td>&check;</td><td>&check;</td><td>&mdash;</td><td>&mdash;</td></tr>
+              <tr><td>GDS</td><td>&mdash;</td><td>&check;</td><td>&mdash;</td><td>&mdash;</td></tr>
+              <tr><td>FlexGen</td><td>&mdash;</td><td>&mdash;</td><td>&check;</td><td>&check;</td></tr>
+              <tr><td>PowerInfer</td><td>&mdash;</td><td>&mdash;</td><td>&check;</td><td>&check;</td></tr>
+              <tr><td>PIPO</td><td>&mdash;</td><td>&mdash;</td><td>&check;</td><td>&check;</td></tr>
+            </tbody>
+          </table>
+        </section>
+
+        <!-- 8. Discussion -->
+        <section id="discussion">
+          <h2>8. Discussion and Future Work</h2>
+
+          <h3>Tier 1 Bandwidth Ceiling</h3>
+          <p>The GPU's PCIe 4.0 x16 link provides ~25 GB/s to host memory &mdash; 7x more than the SN530's 3.4 GB/s. The NVMe is the bottleneck, not the extra hop. With Gen5 NVMe devices approaching 14 GB/s, Tier 2 (direct to GPU VRAM) becomes necessary.</p>
+
+          <h3>Why a Single Thread Suffices</h3>
+          <p>The I/O management thread spends ~2 &mu;s per command, far below the NVMe service time. It consumes one warp slot, leaving 81 SMs free for tensor computation.</p>
+
+          <h3>Bandwidth Utilization: 78% vs BaM's 90%</h3>
+          <p>The 12-point gap is attributable to Tier 1's extra host memory hop (2 PCIe traversals vs 1). Despite this, gpu-nvme-direct extracts 3.2x more bandwidth than CPU-mediated methods on the same platform.</p>
+
+          <h3>Synergy with Quantization</h3>
+          <p>NanoQuant (sub-1-bit) compresses Llama 2 70B from 42 GB to ~8 GB. Combined with gpu-nvme-direct at Gen4 bandwidth: projected ~0.5 tok/s. Quantization reduces I/O volume; GPU-initiated I/O reduces transfer latency.</p>
+
+          <h3>Limitations</h3>
+          <ol>
+            <li>Device asymmetry in evaluation (SN530 Gen3 vs 980 PRO Gen4).</li>
+            <li>Write support implemented but not benchmarked.</li>
+            <li>Sequential access only; random I/O unevaluated.</li>
+            <li>NVIDIA driver patch ties to specific kernel/driver versions.</li>
+          </ol>
+        </section>
+
+        <!-- 9. Conclusion -->
+        <section id="conclusion">
+          <h2>9. Conclusion</h2>
+          <p>We presented gpu-nvme-direct, the first system (to our knowledge) that demonstrates GPU-initiated NVMe I/O on consumer hardware. Using a GeForce RTX 3090 on an AMD B550 platform, a single CUDA thread autonomously manages NVMe I/O queues without any CPU involvement in the data path.</p>
+          <p>Our key insight is that PCIe posted writes succeed on AMD consumer platforms even where P2P reads fail. gpu-nvme-direct achieves 2,666 MB/s (78% of link bandwidth), outperforming CPU-mediated methods by up to 2.2x despite using a slower NVMe device.</p>
+          <p>This work opens the door to GPU-centric storage access on commodity hardware, with applications in LLM inference, graph analytics, and any workload where GPU memory is insufficient to hold the full working set.</p>
+        </section>
+
+        <!-- References -->
+        <section id="references">
+          <h2>References</h2>
+          <ol>
+            <li>Z. Qureshi et al. &ldquo;BaM: A Case for Enabling Fine-grain High Throughput GPU-Orchestrated Access to Storage.&rdquo; ASPLOS, 2023.</li>
+            <li>J. B. Park et al. &ldquo;Accelerating Sampling and Aggregation Operations in GNN Frameworks with GPU Initiated Direct Storage Accesses.&rdquo; VLDB, 2024.</li>
+            <li>Y. Fu et al. &ldquo;ServerlessLLM: Low-Latency Serverless Inference for Large Language Models.&rdquo; OSDI, 2024.</li>
+            <li>Y. Sheng et al. &ldquo;FlexGen: High-Throughput Generative Inference of Large Language Models with a Single GPU.&rdquo; ICML, 2023.</li>
+            <li>Y. Song et al. &ldquo;PowerInfer: Fast Large Language Model Serving with a Consumer-grade GPU.&rdquo; SOSP, 2024.</li>
+            <li>Y. Liu et al. &ldquo;PIPO: Pipelined Offloading for Efficient Inference on Consumer Devices.&rdquo; arXiv:2504.03664, 2025.</li>
+            <li>C. Luo et al. &ldquo;HeadInfer: Memory-Efficient LLM Inference by Head-wise Offloading.&rdquo; arXiv:2502.12574, 2025.</li>
+            <li>InstInfer: In-Storage Attention Offloading for Cost-Effective Long-Context LLM Inference. arXiv:2409.04992, 2024.</li>
+            <li>H. Chong et al. &ldquo;NanoQuant: Efficient Sub-1-Bit Quantization of Large Language Models.&rdquo; arXiv:2602.06694, 2026.</li>
+            <li>NVIDIA Corporation. &ldquo;GPUDirect Storage.&rdquo; docs.nvidia.com/gpudirect-storage/, 2024.</li>
+            <li>Z. Yang et al. &ldquo;SPDK: A Development Kit to Build High Performance Storage Applications.&rdquo; IEEE CloudCom, 2017.</li>
+            <li>NVM Express Workgroup. NVM Express Base Specification, Revision 2.0. nvmexpress.org, 2021.</li>
+          </ol>
+        </section>
+
+      </div>
+
+      <footer>
+        <div class="container">
+          Samuel Cortes &middot; 2026 &middot; <a href="https://naranjositos.tech/">naranjositos.tech</a>
+        </div>
+      </footer>
+
+    </div>
+  </div>
+
+  <script>
+    // Highlight active sidebar link on scroll
+    const sections = document.querySelectorAll('.paper-content section');
+    const navLinks = document.querySelectorAll('.paper-nav a[data-section]');
+
+    const observer = new IntersectionObserver(entries => {
+      entries.forEach(entry => {
+        if (entry.isIntersecting) {
+          navLinks.forEach(a => a.classList.remove('active'));
+          const active = document.querySelector(`.paper-nav a[data-section="${entry.target.id}"]`);
+          if (active) active.classList.add('active');
+        }
+      });
+    }, { rootMargin: '-20% 0px -70% 0px' });
+
+    sections.forEach(s => observer.observe(s));
+  </script>
+
+</body>
+</html>

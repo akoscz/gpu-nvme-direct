@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>gpu-nvme-direct — GPU-Initiated NVMe I/O on Consumer Hardware</title>
+  <meta name="description" content="A system that enables consumer GPUs to autonomously initiate NVMe storage I/O via PCIe MMIO, without CPU involvement in the data path.">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+  <!-- Hero -->
+  <header class="hero">
+    <div class="container">
+      <h1>gpu-nvme-direct</h1>
+      <p class="tagline">GPU-Initiated NVMe I/O on Consumer Hardware</p>
+      <div class="badges">
+        <a class="badge badge--gh" href="https://github.com/xaskasdf/gpu-nvme-direct">GitHub</a>
+        <a class="badge badge--paper" href="paper.html">Paper (HTML)</a>
+        <a class="badge badge--web" href="https://naranjositos.tech/">naranjositos.tech</a>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+
+    <!-- Key stats -->
+    <section>
+      <div class="stat-row">
+        <div class="stat"><span class="value">2,666</span><span class="label">MB/s Throughput</span></div>
+        <div class="stat"><span class="value">78%</span><span class="label">Link Bandwidth</span></div>
+        <div class="stat"><span class="value">2.2x</span><span class="label">vs CPU Baselines</span></div>
+        <div class="stat"><span class="value">~$2k</span><span class="label">Hardware Cost</span></div>
+      </div>
+      <p>A single CUDA thread on a consumer RTX 3090 autonomously manages NVMe I/O queues &mdash; constructing commands, writing doorbells via PTX MMIO, and polling completions &mdash; without any CPU involvement in the data path. This is the first system to demonstrate GPU-initiated NVMe I/O on commodity hardware.</p>
+    </section>
+
+    <!-- Key Insight -->
+    <section>
+      <h2>Key Insight</h2>
+      <p>On AMD consumer platforms (B550/Vermeer), PCIe <strong>posted writes</strong> from GPU to NVMe BAR0 succeed even though non-posted reads fail. Since NVMe doorbells only need writes, a GPU can drive the entire NVMe controller using only posted Memory Write TLPs. This asymmetry has not been documented in prior work.</p>
+
+      <div class="arch-diagram">  RTX 3090                    Host DRAM                    NVMe SN530
+  (GA102)                     (48 GB)                      (PCIe 3.0x4)
+ +---------+               +------------+               +------------+
+ | CUDA    |--MMIO write--&gt;| SQ entries |--DMA fetch---&gt;| Controller |
+ | thread  |--MMIO write--&gt;| Doorbells  |               |            |
+ |         |&lt;--poll CQ----&gt;| CQ entries |&lt;--DMA write---| Flash dies |
+ |         |&lt;--read data--&gt;| Data bufs  |&lt;--DMA write---|            |
+ +---------+               +------------+               +------------+
+     |                          ^                              |
+     +--- PCIe 4.0 x16 --------+-------- PCIe 3.0 x4 ---------+</div>
+    </section>
+
+    <!-- Tiered Approach -->
+    <section>
+      <h2>Tiered P2P Approach</h2>
+      <div class="tier-row">
+        <div class="tier-phase">
+          <span class="tier-num">Tier 1</span>
+          <span class="tier-title">Write-Only P2P</span>
+          <span class="tier-detail">Host pinned memory. Works on AMD consumer. <strong>Implemented.</strong></span>
+        </div>
+        <div class="tier-phase">
+          <span class="tier-num">Tier 2</span>
+          <span class="tier-title">Patched P2P</span>
+          <span class="tier-detail">NVMe DMA to GPU VRAM. Requires tinygrad patches.</span>
+        </div>
+        <div class="tier-phase">
+          <span class="tier-num">Tier 3</span>
+          <span class="tier-title">Native P2P</span>
+          <span class="tier-detail">All in GPU HBM. Enterprise GPUs (A100). BaM approach.</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Throughput -->
+    <section>
+      <h2>Throughput Results (QD=32)</h2>
+      <p><strong>gpu-nvme-direct</strong> uses the slower SN530 (Gen3); CPU baselines use the faster 980 PRO (Gen4). Despite this 2x device disadvantage, gpu-nvme-direct wins at every block size.</p>
+      <table>
+        <thead>
+          <tr><th>Block Size</th><th>gpu_direct</th><th>cpu_memcpy</th><th>cpu_pinned</th><th>cuFile</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>4 KB</td><td><strong>336</strong></td><td>180</td><td>153</td><td>151</td></tr>
+          <tr><td>16 KB</td><td><strong>1,393</strong></td><td>626</td><td>516</td><td>510</td></tr>
+          <tr><td>64 KB</td><td><strong>2,111</strong></td><td>1,373</td><td>1,152</td><td>1,144</td></tr>
+          <tr><td>256 KB</td><td><strong>2,666</strong></td><td>1,731</td><td>1,409</td><td>1,396</td></tr>
+          <tr><td>512 KB</td><td><strong>2,634</strong></td><td>2,008</td><td>1,700</td><td>1,696</td></tr>
+        </tbody>
+      </table>
+      <p>Normalized by PCIe link bandwidth: gpu_direct utilizes <strong>78.4%</strong> of its Gen3 link; cpu_memcpy uses only <strong>24.7%</strong> of its faster Gen4 link. The GPU-initiated path extracts 3.2x more of the available bandwidth.</p>
+    </section>
+
+    <!-- Hardware -->
+    <section>
+      <h2>Hardware</h2>
+      <table>
+        <thead><tr><th>Component</th><th>Detail</th></tr></thead>
+        <tbody>
+          <tr><td>GPU</td><td>NVIDIA RTX 3090 (GA102, 24 GB, PCIe 4.0 x16)</td></tr>
+          <tr><td>CPU</td><td>AMD Ryzen 7 5800X (8C/16T)</td></tr>
+          <tr><td>Platform</td><td>AMD B550, DDR4-3200 (48 GB)</td></tr>
+          <tr><td>NVMe (test)</td><td>WD SN530 1 TB, PCIe 3.0 x4 (VFIO)</td></tr>
+          <tr><td>NVMe (system)</td><td>Samsung 980 PRO 500 GB, PCIe 4.0 x4</td></tr>
+          <tr><td>OS</td><td>Ubuntu 25.10 (kernel 6.17.0)</td></tr>
+          <tr><td>CUDA</td><td>13.1, Driver 590.48.01 (open, patched)</td></tr>
+        </tbody>
+      </table>
+      <p>Total hardware cost: ~$2,000. No enterprise GPU, no PCIe switch, no custom kernel module.</p>
+    </section>
+
+    <!-- LLM Application -->
+    <section>
+      <h2>Application: LLM Inference from NVMe</h2>
+      <p>For models that exceed GPU VRAM (e.g., Llama 2 70B Q6_K at 42 GB on a 24 GB GPU), weights must be streamed from storage per token. gpu-nvme-direct removes the CPU from this critical path:</p>
+      <table>
+        <thead><tr><th>Data Path</th><th>BW</th><th>80 Layers</th><th>tok/s</th></tr></thead>
+        <tbody>
+          <tr><td>mmap+memcpy</td><td>1.5 GB/s</td><td>35.7 s</td><td>0.028</td></tr>
+          <tr><td>gpu-nvme-direct (Gen3)</td><td>2.1 GB/s</td><td>25.5 s</td><td>0.039</td></tr>
+          <tr><td>gpu-nvme-direct (Gen4)</td><td>5.0 GB/s</td><td>10.7 s</td><td><strong>0.093</strong></td></tr>
+        </tbody>
+      </table>
+      <p>Combined with sub-1-bit quantization (NanoQuant), the data volume per token drops from 42 GB to ~8 GB, projecting ~0.5 tok/s at Gen4 bandwidth.</p>
+    </section>
+
+    <!-- Citation -->
+    <section>
+      <h2>Citation</h2>
+      <div class="citation">
+<pre>@article{cortes2026gpunvmedirect,
+  title={gpu-nvme-direct: GPU-Initiated NVMe I/O on Consumer Hardware},
+  author={Cortes, Samuel},
+  year={2026},
+  month={February}
+}</pre>
+      </div>
+    </section>
+
+  </main>
+
+  <footer>
+    <div class="container">
+      Samuel Cortes &middot; 2026 &middot; <a href="https://naranjositos.tech/">naranjositos.tech</a>
+    </div>
+  </footer>
+
+</body>
+</html>
