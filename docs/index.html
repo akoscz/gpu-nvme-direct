@@ -1,154 +1,325 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>gpu-nvme-direct — GPU-Initiated NVMe I/O on Consumer Hardware</title>
-  <meta name="description" content="A system that enables consumer GPUs to autonomously initiate NVMe storage I/O via PCIe MMIO, without CPU involvement in the data path.">
-  <link rel="stylesheet" href="style.css">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>gpu-nvme-direct: GPU-Initiated NVMe I/O on Consumer Hardware</title>
+    <style>
+        :root {
+            --bg: #0d1117;
+            --surface: #161b22;
+            --border: #30363d;
+            --text: #c9d1d9;
+            --text-bright: #f0f6fc;
+            --accent: #ff6b2c;
+            --accent-dim: #d4582a;
+            --link: #58a6ff;
+            --green: #3fb950;
+            --red: #f85149;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.6;
+        }
+        .container { max-width: 900px; margin: 0 auto; padding: 0 24px; }
+        header {
+            border-bottom: 1px solid var(--border);
+            padding: 16px 0;
+        }
+        header .container {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        header h1 {
+            font-size: 20px;
+            color: var(--text-bright);
+            font-weight: 600;
+        }
+        header h1 a { color: var(--link); text-decoration: none; }
+        header h1 a:hover { text-decoration: underline; }
+        .hero {
+            padding: 48px 0 32px;
+            text-align: center;
+        }
+        .hero h2 {
+            font-size: 32px;
+            color: var(--text-bright);
+            margin-bottom: 8px;
+            font-weight: 700;
+        }
+        .hero .subtitle {
+            font-size: 18px;
+            color: var(--text);
+            max-width: 700px;
+            margin: 0 auto 24px;
+        }
+        .hero .author {
+            font-size: 15px;
+            color: var(--text);
+            margin-bottom: 24px;
+        }
+        .hero .author a { color: var(--link); text-decoration: none; }
+        .badges {
+            display: flex;
+            gap: 8px;
+            justify-content: center;
+            flex-wrap: wrap;
+            margin-bottom: 24px;
+        }
+        .badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 16px;
+            font-size: 13px;
+            font-weight: 600;
+            border: 1px solid var(--border);
+        }
+        .badge-green { background: #1a3a2a; color: var(--green); border-color: #2d5a3d; }
+        .badge-red { background: #3a1a1a; color: var(--red); border-color: #5a2d2d; }
+        .badge-orange { background: #3a2a1a; color: var(--accent); border-color: #5a3d2d; }
+        .cta-buttons {
+            display: flex;
+            gap: 12px;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+        .btn {
+            display: inline-block;
+            padding: 10px 24px;
+            border-radius: 6px;
+            font-size: 14px;
+            font-weight: 600;
+            text-decoration: none;
+            transition: all 0.15s;
+        }
+        .btn-primary {
+            background: var(--accent);
+            color: #fff;
+        }
+        .btn-primary:hover { background: var(--accent-dim); }
+        .btn-secondary {
+            background: var(--surface);
+            color: var(--text-bright);
+            border: 1px solid var(--border);
+        }
+        .btn-secondary:hover { background: #1f2937; border-color: var(--text); }
+        section { padding: 32px 0; }
+        section h3 {
+            font-size: 22px;
+            color: var(--text-bright);
+            margin-bottom: 16px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid var(--border);
+        }
+        .abstract {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 24px;
+            margin: 24px 0;
+            font-size: 15px;
+        }
+        .abstract h4 { color: var(--accent); margin-bottom: 12px; font-size: 14px; text-transform: uppercase; letter-spacing: 1px; }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 16px 0;
+            font-size: 14px;
+        }
+        th, td {
+            padding: 8px 12px;
+            text-align: left;
+            border-bottom: 1px solid var(--border);
+        }
+        th { color: var(--text-bright); font-weight: 600; background: var(--surface); }
+        td { font-family: 'SFMono-Regular', Consolas, monospace; }
+        .highlight { color: var(--accent); font-weight: 700; }
+        .results-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+            margin: 16px 0;
+        }
+        .result-card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 20px;
+            text-align: center;
+        }
+        .result-card .value {
+            font-size: 28px;
+            font-weight: 700;
+            color: var(--accent);
+        }
+        .result-card .label {
+            font-size: 13px;
+            color: var(--text);
+            margin-top: 4px;
+        }
+        .arch-diagram {
+            background: #0d1117;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 20px;
+            margin: 16px 0;
+            font-family: 'SFMono-Regular', Consolas, monospace;
+            font-size: 13px;
+            line-height: 1.4;
+            overflow-x: auto;
+            white-space: pre;
+            color: var(--green);
+        }
+        footer {
+            border-top: 1px solid var(--border);
+            padding: 24px 0;
+            text-align: center;
+            font-size: 13px;
+            color: #484f58;
+        }
+        footer a { color: var(--link); text-decoration: none; }
+        @media (max-width: 600px) {
+            .hero h2 { font-size: 24px; }
+            .results-grid { grid-template-columns: repeat(2, 1fr); }
+        }
+    </style>
 </head>
 <body>
 
-  <!-- Hero -->
-  <header class="hero">
+<header>
     <div class="container">
-      <h1>gpu-nvme-direct</h1>
-      <p class="tagline">GPU-Initiated NVMe I/O on Consumer Hardware</p>
-      <div class="badges">
-        <a class="badge badge--gh" href="https://github.com/xaskasdf/gpu-nvme-direct">GitHub</a>
-        <a class="badge badge--paper" href="paper.html">Paper (HTML)</a>
-        <a class="badge badge--web" href="https://naranjositos.tech/">naranjositos.tech</a>
-      </div>
+        <h1><a href="https://github.com/xaskasdf/gpu-nvme-direct">xaskasdf/gpu-nvme-direct</a></h1>
     </div>
-  </header>
+</header>
 
-  <main class="container">
+<div class="container">
 
-    <!-- Key stats -->
-    <section>
-      <div class="stat-row">
-        <div class="stat"><span class="value">3,350</span><span class="label">MB/s Throughput</span></div>
-        <div class="stat"><span class="value">99%</span><span class="label">Link Bandwidth</span></div>
-        <div class="stat"><span class="value">2.2x</span><span class="label">vs CPU Baselines</span></div>
-        <div class="stat"><span class="value">~$2k</span><span class="label">Hardware Cost</span></div>
-      </div>
-      <p>A single CUDA thread on a consumer RTX 3090 autonomously manages NVMe I/O queues &mdash; constructing commands, writing doorbells via PTX MMIO, and polling completions &mdash; without any CPU involvement in the data path. This is the first system to demonstrate GPU-initiated NVMe I/O on commodity hardware.</p>
-    </section>
+<div class="hero">
+    <h2>gpu-nvme-direct</h2>
+    <p class="subtitle">GPU-Initiated NVMe I/O on Consumer Hardware</p>
+    <p class="author">Samuel Cortes &mdash; <a href="https://naranjositos.tech">naranjositos.tech</a> &mdash; February 2026</p>
 
-    <!-- Key Insight -->
-    <section>
-      <h2>Key Insight</h2>
-      <p>On AMD consumer platforms (B450/Vermeer), PCIe <strong>posted writes</strong> from GPU to NVMe BAR0 succeed even though non-posted reads fail. Since NVMe doorbells only need writes, a GPU can drive the entire NVMe controller using only posted Memory Write TLPs. This asymmetry has not been documented in prior work.</p>
+    <div class="badges">
+        <span class="badge badge-green">3,350 MB/s sustained</span>
+        <span class="badge badge-red">99% PCIe link utilization</span>
+        <span class="badge badge-orange">Zero CPU in data path</span>
+    </div>
 
-      <div class="arch-diagram">  RTX 3090                    Host DRAM                    NVMe SN530
-  (GA102)                     (48 GB)                      (PCIe 3.0x4)
- +---------+               +------------+               +------------+
- | CUDA    |--MMIO write--&gt;| SQ entries |--DMA fetch---&gt;| Controller |
- | thread  |--MMIO write--&gt;| Doorbells  |               |            |
- |         |&lt;--poll CQ----&gt;| CQ entries |&lt;--DMA write---| Flash dies |
- |         |&lt;--read data--&gt;| Data bufs  |&lt;--DMA write---|            |
- +---------+               +------------+               +------------+
-     |                          ^                              |
-     +--- PCIe 3.0 x8 ---------+-------- PCIe 3.0 x4 ---------+</div>
-    </section>
+    <div class="cta-buttons">
+        <a href="gpu-nvme-direct-paper.pdf" class="btn btn-primary" download>Download Paper (PDF)</a>
+        <a href="paper.html" class="btn btn-secondary">Read Online</a>
+        <a href="https://github.com/xaskasdf/gpu-nvme-direct" class="btn btn-secondary">Source Code</a>
+    </div>
+</div>
 
-    <!-- Tiered Approach -->
-    <section>
-      <h2>Tiered P2P Approach</h2>
-      <div class="tier-row">
-        <div class="tier-phase">
-          <span class="tier-num">Tier 1</span>
-          <span class="tier-title">Write-Only P2P</span>
-          <span class="tier-detail">Host pinned memory. Works on AMD consumer. <strong>Implemented.</strong></span>
+<div class="abstract">
+    <h4>Abstract</h4>
+    <p>We present <strong>gpu-nvme-direct</strong>, a system that enables a consumer GPU (NVIDIA GeForce RTX 3090) to autonomously initiate NVMe storage I/O operations via PCIe MMIO, entirely without CPU involvement in the data path. Unlike prior work that requires enterprise GPUs with native peer-to-peer (P2P) DMA support, gpu-nvme-direct operates on commodity hardware (AMD Ryzen 5800X, B450 motherboard) costing approximately $2,000.</p>
+    <p style="margin-top: 12px;">We evaluate on two NVMe devices: a WD SN530 (PCIe 3.0 x4), where gpu-nvme-direct achieves 2,666 MB/s (78% of link bandwidth), and a WD SN740 (PCIe 4.0 x4), where it reaches 3,350 MB/s sustained (99% of link bandwidth). Integrated into a streaming inference engine, gpu-nvme-direct achieves 0.06 tok/s for Llama 70B from NVMe alone, and 0.50 tok/s when combined with tiered caching on a single RTX 3090.</p>
+</div>
+
+<section>
+    <h3>Key Results</h3>
+    <div class="results-grid">
+        <div class="result-card">
+            <div class="value">3,350</div>
+            <div class="label">MB/s sustained (SN740)</div>
         </div>
-        <div class="tier-phase">
-          <span class="tier-num">Tier 2</span>
-          <span class="tier-title">Patched P2P</span>
-          <span class="tier-detail">NVMe DMA to GPU VRAM. Requires tinygrad patches.</span>
+        <div class="result-card">
+            <div class="value">99%</div>
+            <div class="label">PCIe link utilization</div>
         </div>
-        <div class="tier-phase">
-          <span class="tier-num">Tier 3</span>
-          <span class="tier-title">Native P2P</span>
-          <span class="tier-detail">All in GPU HBM. Enterprise GPUs (A100). BaM approach.</span>
+        <div class="result-card">
+            <div class="value">2.2x</div>
+            <div class="label">over CPU baselines</div>
         </div>
-      </div>
-    </section>
+        <div class="result-card">
+            <div class="value">0.50</div>
+            <div class="label">tok/s Llama 70B</div>
+        </div>
+    </div>
+</section>
 
-    <!-- Throughput -->
-    <section>
-      <h2>Throughput Results (QD=32)</h2>
-      <p><strong>gpu-nvme-direct</strong> uses the slower SN530 (Gen3); CPU baselines use the faster 980 PRO (Gen4). Despite this 2x device disadvantage, gpu-nvme-direct wins at every block size.</p>
-      <table>
-        <thead>
-          <tr><th>Block Size</th><th>gpu_direct</th><th>cpu_memcpy</th><th>cpu_pinned</th><th>cuFile</th></tr>
-        </thead>
-        <tbody>
-          <tr><td>4 KB</td><td><strong>336</strong></td><td>180</td><td>153</td><td>151</td></tr>
-          <tr><td>16 KB</td><td><strong>1,393</strong></td><td>626</td><td>516</td><td>510</td></tr>
-          <tr><td>64 KB</td><td><strong>2,111</strong></td><td>1,373</td><td>1,152</td><td>1,144</td></tr>
-          <tr><td>256 KB</td><td><strong>2,666</strong></td><td>1,731</td><td>1,409</td><td>1,396</td></tr>
-          <tr><td>512 KB</td><td><strong>2,634</strong></td><td>2,008</td><td>1,700</td><td>1,696</td></tr>
-        </tbody>
-      </table>
-      <p>Normalized by PCIe link bandwidth: gpu_direct utilizes <strong>78%</strong> of its Gen3 link (SN530) and <strong>99%</strong> (SN740); cpu_memcpy uses only <strong>25%</strong> of its faster Gen4 link. The GPU-initiated path extracts 3&ndash;4x more of the available bandwidth.</p>
-    </section>
+<section>
+    <h3>Architecture</h3>
+    <div class="arch-diagram">        GPU (RTX 3090)             NVMe (SN740)
+       +-------------+           +-----------+
+       | CUDA kernel | ==MMIO==> | BAR0      |
+       | (1 thread)  | doorbell  | registers |
+       |  sq_submit  | writes    |           |
+       |  cq_poll    |           +-----------+
+       +------+------+                |
+              |                       | DMA
+              v                       v
+       +------+------+           +-----------+
+       | Host pinned |  <==DMA== | NVMe DMA  |
+       | memory      |   data    | engine    |
+       | SQ/CQ/Data  |           |           |
+       +-------------+           +-----------+</div>
+    <p style="margin-top: 12px;">The GPU writes NVMe doorbell registers via PCIe posted MMIO writes (PTX <code>st.relaxed.mmio.sys</code>). The CPU is not involved in the I/O data path. This works on AMD consumer platforms where P2P reads fail, because only <em>posted writes</em> are needed to drive an NVMe controller.</p>
+</section>
 
-    <!-- Hardware -->
-    <section>
-      <h2>Hardware</h2>
-      <table>
-        <thead><tr><th>Component</th><th>Detail</th></tr></thead>
-        <tbody>
-          <tr><td>GPU</td><td>NVIDIA RTX 3090 (GA102, 24 GB, PCIe 3.0 x8*)</td></tr>
-          <tr><td>CPU</td><td>AMD Ryzen 7 5800X (8C/16T)</td></tr>
-          <tr><td>Platform</td><td>AMD B450, DDR4-3200 (48 GB)</td></tr>
-          <tr><td>NVMe (test 1)</td><td>WD SN530 1 TB, PCIe 3.0 x4 (VFIO)</td></tr>
-          <tr><td>NVMe (test 2)</td><td>WD SN740 512 GB, PCIe 3.0 x4 (VFIO)</td></tr>
-          <tr><td>NVMe (system)</td><td>Samsung 980 PRO 500 GB, PCIe 4.0 x4</td></tr>
-          <tr><td>OS</td><td>Ubuntu 25.10 (kernel 6.17.0)</td></tr>
-          <tr><td>CUDA</td><td>13.1, Driver 590.48.01 (open, patched)</td></tr>
-        </tbody>
-      </table>
-      <p>*B450 shares PCIe lanes between GPU slot and M.2: GPU negotiates Gen3 x8 (~6.5 GB/s H2D) when NVMe is populated.</p>
-      <p>Total hardware cost: ~$2,000. No enterprise GPU, no PCIe switch, no custom kernel module.</p>
-    </section>
+<section>
+    <h3>Throughput Comparison (QD=32)</h3>
+    <table>
+        <tr><th>Block Size</th><th>gpu-nvme-direct</th><th>CPU memcpy</th><th>CPU pinned</th><th>cuFile (GDS)</th></tr>
+        <tr><td>4 KB</td><td class="highlight">336 MB/s</td><td>180</td><td>153</td><td>151</td></tr>
+        <tr><td>16 KB</td><td class="highlight">1,393 MB/s</td><td>626</td><td>516</td><td>510</td></tr>
+        <tr><td>64 KB</td><td class="highlight">2,111 MB/s</td><td>1,373</td><td>1,152</td><td>1,144</td></tr>
+        <tr><td>256 KB</td><td class="highlight">2,666 MB/s</td><td>1,731</td><td>1,409</td><td>1,396</td></tr>
+        <tr><td>512 KB</td><td class="highlight">2,634 MB/s</td><td>2,008</td><td>1,700</td><td>1,696</td></tr>
+    </table>
+    <p style="margin-top: 8px; font-size: 13px; color: #484f58;">Note: gpu-nvme-direct uses the slower SN530 (Gen3 x4). CPU baselines use the faster 980 PRO (Gen4 x4). Despite this 2x device asymmetry, gpu-nvme-direct achieves higher throughput at all block sizes.</p>
+</section>
 
-    <!-- LLM Application -->
-    <section>
-      <h2>Application: LLM Inference from NVMe</h2>
-      <p>For models that exceed GPU VRAM (e.g., Llama 70B Q6_K at 42 GB on a 24 GB GPU), weights must be streamed from storage per token. gpu-nvme-direct removes the CPU from this critical path. Measured results from ntransformer integration:</p>
-      <table>
-        <thead><tr><th>Data Path</th><th>BW</th><th>tok/s</th></tr></thead>
-        <tbody>
-          <tr><td>mmap+memcpy (CPU)</td><td>1.5 GB/s</td><td>0.03</td></tr>
-          <tr><td>gpu-nvme-direct (SN740)</td><td>3.35 GB/s</td><td>0.06</td></tr>
-          <tr><td>Tiered VRAM/RAM</td><td>6.5 GB/s</td><td>0.20</td></tr>
-          <tr><td>Tiered + layer skip + Q4_K_M</td><td>6.5 GB/s</td><td><strong>0.50</strong></td></tr>
-        </tbody>
-      </table>
-      <p>17x improvement over CPU-mediated NVMe baseline. Combined with NanoQuant (sub-1-bit quantization), NVMe-only streaming could match tiered results without RAM caching.</p>
-    </section>
+<section>
+    <h3>LLM Inference</h3>
+    <table>
+        <tr><th>Configuration</th><th>BW</th><th>tok/s</th></tr>
+        <tr><td>mmap+memcpy (baseline)</td><td>1.5 GB/s</td><td>0.028</td></tr>
+        <tr><td>gpu-nvme-direct NVMe-only (SN530)</td><td>2.1 GB/s</td><td>0.04</td></tr>
+        <tr><td>gpu-nvme-direct NVMe-only (SN740)</td><td>3.35 GB/s</td><td>0.06</td></tr>
+        <tr><td>Tiered VRAM/RAM (no NVMe)</td><td>6.5 GB/s</td><td>0.20</td></tr>
+        <tr><td>Tiered + layer skip</td><td>6.5 GB/s</td><td>0.27</td></tr>
+        <tr><td class="highlight">Tiered + Q4_K_M + skip</td><td>6.5 GB/s</td><td class="highlight">0.50</td></tr>
+    </table>
+    <p style="margin-top: 8px; font-size: 13px;">Llama 3.1-70B, Q6_K quantization (~42 GB, 80 layers), single RTX 3090.</p>
+</section>
 
-    <!-- Citation -->
-    <section>
-      <h2>Citation</h2>
-      <div class="citation">
-<pre>@article{cortes2026gpunvmedirect,
+<section>
+    <h3>Hardware</h3>
+    <table>
+        <tr><th>Component</th><th>Detail</th></tr>
+        <tr><td>GPU</td><td>NVIDIA RTX 3090 (GA102, 24 GB, PCIe 3.0 x8 on B450)</td></tr>
+        <tr><td>CPU</td><td>AMD Ryzen 7 5800X (8C/16T)</td></tr>
+        <tr><td>Platform</td><td>ASUS ROG STRIX B450-F GAMING II, 48 GB DDR4</td></tr>
+        <tr><td>NVMe (test)</td><td>WD SN740 512 GB (Gen4 device, Gen3 on B450)</td></tr>
+        <tr><td>NVMe (boot)</td><td>WD SN530 1 TB (Gen3 x4)</td></tr>
+        <tr><td>OS/CUDA</td><td>Ubuntu 25.10, kernel 6.17, CUDA 13.1</td></tr>
+    </table>
+</section>
+
+<section>
+    <h3>Citation</h3>
+    <div class="arch-diagram" style="color: var(--text); font-size: 12px;">@article{cortes2026gpunvmedirect,
   title={gpu-nvme-direct: GPU-Initiated NVMe I/O on Consumer Hardware},
   author={Cortes, Samuel},
   year={2026},
-  month={February}
-}</pre>
-      </div>
-    </section>
+  url={https://github.com/xaskasdf/gpu-nvme-direct}
+}</div>
+</section>
 
-  </main>
+</div>
 
-  <footer>
+<footer>
     <div class="container">
-      Samuel Cortes &middot; 2026 &middot; <a href="https://naranjositos.tech/">naranjositos.tech</a>
+        <p>&copy; 2026 Samuel Cortes &mdash; <a href="https://naranjositos.tech">naranjositos.tech</a> &mdash; BSD-2-Clause License</p>
     </div>
-  </footer>
+</footer>
 
 </body>
 </html>
