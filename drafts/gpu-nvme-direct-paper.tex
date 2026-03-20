@@ -618,6 +618,18 @@ CPU-mediated methods. This gap is explained by Little's Law
 $\text{QD} = \text{BW} \times \text{latency}$, and only \sysname{} maintains
 sufficient queue depth from the device's perspective.
 
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{../figures/fig7_bandwidth_normalization.pdf}
+\caption{PCIe link bandwidth utilization at 256\,KB, QD=32. \sysname{}
+  extracts 78--99\% of the Gen3~$\times$4 link bandwidth, while CPU methods
+  utilize only 20--25\% of their faster Gen4~$\times$4 link. The 3--4$\times$
+  gap in utilization efficiency is explained by Little's Law
+  (\S\ref{sec:pipeline-analysis}): only \sysname{} maintains sufficient
+  device-side queue depth to saturate the NVMe controller.}
+\label{fig:bw-normalization}
+\end{figure}
+
 \textbf{Methodology:} Each configuration (block size $\times$ queue depth) is
 run 3 times. We measure per-completion latency using the GPU clock
 (\texttt{clock64()}), wall-clock time, and CPU utilization via
@@ -626,8 +638,19 @@ range from 4\,KB to 512\,KB; queue depths from 1 to 32.
 
 \subsection{Throughput}
 
-Figure~\ref{fig:throughput-qd} shows throughput scaling with queue depth for
-each method.
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{../figures/fig1_throughput_vs_qd.pdf}
+\caption{Throughput vs.\ queue depth by block size. \sysname{} (red) scales
+  dramatically with queue depth due to GPU-maintained pipeline parallelism,
+  while CPU-mediated methods (blue, green, orange) show no scaling because the
+  kernel I/O stack serializes requests to effective QD$\approx$1. The gap is
+  most pronounced at 16\,KB (2.2$\times$ at QD=32). Note: \sysname{} uses the
+  slower SN530 (Gen3); CPU methods use the faster 980~PRO (Gen4).}
+\label{fig:throughput-qd}
+\end{figure*}
+
+Table~\ref{tab:throughput} summarizes throughput at QD=32.
 
 \begin{table}[t]
 \centering
@@ -694,6 +717,26 @@ differentiator.
 \end{tabular}
 \end{table}
 
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{../figures/fig2_throughput_vs_bs.pdf}
+\caption{Throughput vs.\ block size at QD=32. \sysname{} dominates across
+  all block sizes despite using a slower NVMe device. Peak: 2{,}666\MBs{}
+  at 256\,KB (78\% of Gen3~$\times$4 limit). The SN740 achieves
+  3{,}350\MBs{} (99\%) at the same configuration (not shown).}
+\label{fig:throughput-bs}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{../figures/fig5_scaling_heatmap.pdf}
+\caption{Queue depth scaling factor (QD=32/QD=1 throughput ratio).
+  \sysname{} (top row) achieves 1.4--2.3$\times$ scaling; CPU methods
+  ($\sim$1.0$\times$) gain nothing from deeper queues because the
+  OS I/O stack serializes requests.}
+\label{fig:scaling-heatmap}
+\end{figure}
+
 \subsection{Latency}
 
 Table~\ref{tab:latency} shows median per-operation latency. At QD=1, each
@@ -728,6 +771,16 @@ At QD=1, \sysname{} achieves lower latency than CPU methods for small blocks
 This is because the GPU writes the doorbell directly via MMIO, avoiding the
 CPU's system call, I/O scheduler, and interrupt handling overhead.
 
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{../figures/fig3_latency_4k_qd1.pdf}
+\caption{Per-operation latency at 4\,KB, QD=1. \sysname{} achieves
+  10.6\us{} median (46\% lower than \texttt{cpu\_memcpy}'s 19.5\us{})
+  by bypassing the kernel I/O stack and writing the doorbell directly
+  via MMIO. Error bars show min/max across 1{,}000 operations.}
+\label{fig:latency-4k}
+\end{figure}
+
 \subsection{CPU Utilization}
 
 \begin{table}[t]
@@ -754,6 +807,16 @@ preprocessing) during GPU-driven I/O. In contrast, the CPU methods block a
 thread on I/O completion, making that thread unavailable for computation
 despite showing lower aggregate CPU utilization across all 16 logical cores.
 
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{../figures/fig4_cpu_utilization.pdf}
+\caption{CPU utilization (mean $\pm$ stddev) across all configurations.
+  \sysname{}'s 8.3\% reflects CUDA runtime overhead, not I/O work---the
+  CPU is free for computation during GPU-driven I/O. CPU methods block
+  a thread on I/O completion despite lower aggregate utilization.}
+\label{fig:cpu-util}
+\end{figure}
+
 \subsection{cuFile on Consumer Hardware}
 
 A notable finding is that NVIDIA cuFile (GPUDirect Storage API) performs
@@ -762,6 +825,16 @@ all 60 configurations, the two methods differ by less than 3\% on average.
 This confirms that GDS falls back to a CPU-mediated path on consumer GPUs,
 providing no hardware acceleration. \sysname{} fills this gap by providing
 genuine GPU-initiated I/O on hardware that GDS does not support.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{../figures/fig6_speedup_bar.pdf}
+\caption{Speedup of \sysname{} over \texttt{cpu\_memcpy} at QD=32.
+  The advantage ranges from 1.32$\times$ (512\,KB) to 2.23$\times$ (16\,KB).
+  This comparison is conservative: \sysname{} uses the slower SN530
+  (Gen3) while \texttt{cpu\_memcpy} uses the faster 980~PRO (Gen4).}
+\label{fig:speedup}
+\end{figure}
 
 \subsection{Large Sequential Reads}
 
@@ -827,6 +900,17 @@ Tiered + Q4\_K\_M + skip      & 6.5\GBs{} & \textbf{0.50} \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{../figures/fig8_llm_inference.pdf}
+\caption{Llama-70B inference throughput by data path configuration.
+  From NVMe-only streaming (0.03--0.06~tok/s) to tiered caching with
+  quantization (0.50~tok/s), an 18$\times$ improvement over the
+  CPU-mediated baseline. Projected (from raw I/O bandwidth) and
+  measured (ntransformer integration) results agree closely.}
+\label{fig:llm-inference}
+\end{figure}
 
 \textbf{Measured integration results.} We integrated \sysname{} into
 ntransformer, a streaming LLM inference engine with tiered caching
@@ -1266,9 +1350,11 @@ B.~Chen, and A.~Anandkumar.
 \newblock {\em arXiv:2502.12574}, 2025.
 
 \bibitem{instinfer2024}
-{InstInfer}: In-Storage Attention Offloading for Cost-Effective Long-Context
-  {LLM} Inference.
-\newblock {\em arXiv:2409.04992}, 2024.
+X.~Pan, E.~Li, Q.~Li, S.~Liang, Y.~Shan, K.~Zhou, Y.~Luo, X.~Wang,
+and J.~Zhang.
+\newblock {InstInfer}: In-Storage Attention Offloading for Cost-Effective
+  Long-Context {LLM} Inference.
+\newblock In {\em Proc.\ HPCA}, 2025.
 
 \bibitem{chong2026nanoquant}
 H.~Chong, D.~Kim, C.~Kim, and M.~Choi.
@@ -1277,19 +1363,23 @@ H.~Chong, D.~Kim, C.~Kim, and M.~Choi.
 \newblock {\em arXiv:2602.06694}, 2026.
 
 \bibitem{cheops2025io}
-{An I/O Characterizing Study of Offloading LLM Models and KV Caches to NVMe
-  SSD}.
-\newblock In {\em Proc.\ CHEOPS}, ACM, 2025.
+Z.~Ren, K.~Doekemeijer, T.~De~Matteis, C.~Pinto, R.~Stoica, and A.~Trivedi.
+\newblock An {I/O} Characterizing Study of Offloading {LLM} Models and {KV}
+  Caches to {NVMe} {SSD}.
+\newblock In {\em Proc.\ CHEOPS (EuroSys Workshop)}, ACM, 2025.
 
 \bibitem{phoenix2025}
-{Phoenix}: A Refactored {I/O} Stack for {GPU} Direct Storage without Phony
-  Buffers.
-\newblock In {\em Proc.\ EuroSys}, ACM, 2025.
+J.~Yan, S.~Qiu, Y.~Lv, Y.~Hu, H.~Chen, Z.~Shen, X.~Yao, R.~Chen,
+J.~Shu, G.~Zhang, and Y.~Zhang.
+\newblock {Phoenix}: A Refactored {I/O} Stack for {GPU} Direct Storage without
+  Phony Buffers.
+\newblock In {\em Proc.\ SC}, ACM, 2025.
 
 \bibitem{zhong2025cxl}
-Y.~Zhong \emph{et al.}
+Y.~Zhong, D.~S.~Berger, P.~Zardoshti, E.~Saurez, J.~Nelson, A.~Psistakis,
+J.~Fried, and A.~Cidon.
 \newblock My {CXL} Pool Obviates Your {PCIe} Switch.
-\newblock In {\em Proc.\ OSDI}, 2025.
+\newblock In {\em Proc.\ HotOS}, 2025.
 
 \bibitem{nvme-spec}
 {NVM Express Workgroup}.
